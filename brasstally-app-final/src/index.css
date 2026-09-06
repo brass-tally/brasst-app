@@ -1,0 +1,331 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ================= tokens =================
+   The palette's source of truth is PALETTES in src/ui/tokens.js — applyThemeVars
+   mirrors it onto the document root as inline custom properties, which override
+   everything below. These static copies exist for one reason: the frame between
+   first paint and React mounting. The pre-paint script in index.html sets
+   data-theme, so that frame already lands on the right ground colour instead of
+   flashing the dark ledger at someone who chose light. */
+/* Light is the ground state, so the fallback block is the light palette and the
+   dark one is the override. That way a first visit paints paper immediately. */
+:root {
+  --bg: #FAF9F7; --surface: #FFFFFF; --surface2: #F5F3F0;
+  --line: #EDEAE5; --linehover: #E2DDD6;
+  --text: #1C1917; --muted: #5A534E; --faint: #8A827B;
+  --credit: #08805A; --debit: #C4442F;
+  --brass: #F59E0B;        /* fills */
+  --brasstext: #A9620A;    /* text, borders, icons. 4.73:1 on surface */
+  --onbrass: #241703;
+  --overlay: rgba(28, 25, 23, 0.40);
+  --glass: rgba(250, 249, 247, 0.84);
+  color-scheme: light;
+}
+html[data-theme="dark"] {
+  --bg: #100E0C; --surface: #1A1714; --surface2: #221E1A;
+  --line: #2A2521; --linehover: #37312B;
+  --text: #F5F1EC; --muted: #B0A79F; --faint: #877E76;
+  --credit: #34D399; --debit: #FB7185;
+  --brass: #FBBF24; --brasstext: #FBBF24; --onbrass: #1C1200;
+  --overlay: rgba(8, 6, 4, 0.72);
+  --glass: rgba(16, 14, 12, 0.84);
+  color-scheme: dark;
+}
+
+/* The house easing curve. One curve for the whole product — the landing page
+   uses this same one, so a transition in the app and a transition on the
+   marketing site decelerate identically. */
+:root { --ease: cubic-bezier(.2, .8, .2, 1); }
+
+/* ================= base ================= */
+html, body, #root { min-height: 100%; }
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 17px;
+  line-height: 1.7;
+  letter-spacing: -0.011em;
+  font-feature-settings: 'cv11', 'ss01';
+  font-weight: 400;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  transition: background-color .3s ease, color .3s ease;
+}
+button { -webkit-tap-highlight-color: transparent; }
+
+/* Headings are Fraunces, the landing page's serif. At UI sizes its default
+   optical size is set for display copy and reads too fragile, so pin opsz and
+   pull the tracking in — the letterforms stay editorial, the fit stays tight. */
+/* Headings share the body family. Weight and tracking carry the hierarchy, which
+   reads cleaner at UI sizes than a display serif did. */
+h1, h2, h3 {
+  font-weight: 600;
+  letter-spacing: -0.028em;
+  line-height: 1.16;
+}
+
+/* Numbers: Geist Mono, tabular so columns never jitter. */
+.tabular-nums { font-variant-numeric: tabular-nums lining-nums; letter-spacing: -0.01em; }
+
+/* The mono eyebrow above section headings — brass, wide, small. Lifted from
+   the landing page, where it labels every section. */
+/* Sentence case in the body face rather than tracked-out mono, which was the
+   single biggest reason the interface read as dated. Colour comes from
+   --brasstext, because --brass as text measured 2.04:1 on the light surface. */
+.eyebrow {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--brasstext);
+}
+
+/* Thin scrollbars, in the palette rather than the OS default. */
+* { scrollbar-width: thin; scrollbar-color: rgba(127, 132, 123, .35) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: rgba(127, 132, 123, .35); border-radius: 99px; }
+
+/* Motion is a courtesy, not a requirement. Everything below collapses to an
+   instant state change for anyone who has asked their OS to stop animating. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  /* A reveal that never animates has to start visible, or the content it
+     wraps stays at opacity 0 forever. */
+  .rv { opacity: 1 !important; transform: none !important; }
+}
+
+/* ---- buttons ----
+   Filled buttons lift by brightening rather than by swapping to a second
+   hard-coded colour, so every tone (brass, credit, debit, ghost) gets a
+   consistent response without the palette needing a hover value for each. */
+.btn-surface:not(:disabled):hover { filter: brightness(1.08); }
+.btn-surface:not(:disabled):active { filter: brightness(0.96); }
+
+/* ---- focus ----
+   One visible ring for keyboard users across every interactive element. Uses
+   :focus-visible so a mouse click does not leave a ring behind. */
+:where(button, a, [role="button"], summary):focus-visible {
+  outline: 2px solid var(--ring, #E0B65A);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* ---- cards ----
+   The resting state carries a shadow already; hover raises it and floats the
+   card a single pixel, and the hairline warms toward --linehover. Transform,
+   not margin, so it stays on the compositor. */
+.card-interactive {
+  transition: transform 180ms var(--ease),
+              box-shadow 180ms var(--ease),
+              border-color 180ms ease;
+  will-change: transform;
+}
+.card-interactive:hover { transform: translateY(-2px); border-color: var(--linehover); }
+.card-interactive:active { transform: translateY(0); }
+
+/* Rows in the ledger and tables: no lift, just a ground shift, so long lists
+   do not shimmer as the pointer crosses them. The colour comes from the
+   palette via a variable, so the row follows a theme swap without re-rendering
+   every line in the list. */
+.row-interactive { transition: background-color 140ms ease; }
+.row-interactive:hover { background-color: var(--row-hover, transparent); }
+
+/* ---- reveals ----
+   Sections arrive as you reach them rather than all at once on load, so a long
+   tab assembles itself instead of dumping. Driven by the Reveal component's
+   IntersectionObserver, which adds .in. The delay steps let a row of cards
+   stagger without each one needing its own timer. */
+.rv {
+  opacity: 0;
+  transform: translateY(18px);
+  transition: opacity .6s ease, transform .6s var(--ease);
+}
+.rv.in { opacity: 1; transform: none; }
+.rv.d1 { transition-delay: .07s; }
+.rv.d2 { transition-delay: .14s; }
+.rv.d3 { transition-delay: .21s; }
+.rv.d4 { transition-delay: .28s; }
+
+/* ---- tab + key transitions ---- */
+@keyframes tabEnter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.tab-enter { animation: tabEnter .34s var(--ease); }
+
+/* A tab's sections arrive in sequence rather than as one block. The children
+   are already on screen when a tab opens, so this is a mount stagger rather
+   than a scroll reveal — no observer, and nothing to reset when you switch
+   back. Six steps is enough: past that the wait outweighs the effect, so
+   everything from the seventh section on lands with the sixth. */
+.stagger > * { animation: riseIn .44s var(--ease) backwards; }
+.stagger > *:nth-child(1) { animation-delay: .02s; }
+.stagger > *:nth-child(2) { animation-delay: .08s; }
+.stagger > *:nth-child(3) { animation-delay: .14s; }
+.stagger > *:nth-child(4) { animation-delay: .20s; }
+.stagger > *:nth-child(5) { animation-delay: .26s; }
+.stagger > *:nth-child(n+6) { animation-delay: .32s; }
+@keyframes fadeKey { from { opacity: 0; } to { opacity: 1; } }
+.fade-in-key { animation: fadeKey .34s ease; }
+@keyframes riseIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+.rise-in { animation: riseIn .4s var(--ease) both; }
+
+/* ---- modals ---- */
+@keyframes overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.modal-overlay {
+  animation: overlay-in 160ms ease;
+  backdrop-filter: blur(6px) saturate(120%);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+}
+.modal-panel {
+  animation: panel-in 220ms var(--ease);
+  /* The hairline along the top edge is what sells the glass: a lit rim where
+     the panel catches the light, then a soft inner falloff below it. */
+  position: relative;
+}
+.modal-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+/* ---- skeletons ----
+   A sheen crossing a block, rather than a spinner in the middle of an empty
+   page: the shapes tell you what is arriving while it arrives. */
+@keyframes skeleton-sheen {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--skeleton-base, rgba(255, 255, 255, 0.05));
+  border-radius: 8px;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--skeleton-sheen, rgba(255, 255, 255, 0.06)),
+    transparent
+  );
+  animation: skeleton-sheen 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after { display: none; }
+}
+
+/* ---- charts ----
+   Bars grow from their baseline on mount instead of snapping to full height.
+   Scale, not height, so the browser animates it on the GPU. */
+@keyframes bar-rise-y {
+  from { transform: scaleY(0); }
+  to   { transform: scaleY(1); }
+}
+@keyframes bar-rise-x {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+.bar-rise-y {
+  transform-origin: bottom;
+  animation: bar-rise-y 520ms var(--ease) backwards;
+}
+.bar-rise-x {
+  transform-origin: left;
+  animation: bar-rise-x 560ms var(--ease) backwards;
+}
+
+/* ---- capture sheet + dock ---- */
+.capture-pop {
+  opacity: 0;
+  transform: translateY(12px) scale(.98);
+  pointer-events: none;
+  transition: opacity .28s ease, transform .28s var(--ease);
+}
+.capture-pop.open { opacity: 1; transform: none; pointer-events: auto; }
+@media (prefers-reduced-motion: reduce) { .capture-pop { transition: none; } }
+
+/* Dock: comfortable, safe-area aware, responsive hit targets. Eight sections
+   plus Tally have to fit on one row without wrapping or scrolling (a scroll
+   container would clip the tooltips above it), so the sections give up width
+   as the screen narrows and Tally never does. */
+.dock { margin-bottom: env(safe-area-inset-bottom, 0px); }
+.dock-btn { width: 42px; height: 42px; }
+.dock-capture { width: 44px; height: 44px; transition: transform .18s var(--ease); }
+.dock-btn:active { transform: scale(.9) !important; }
+.dock-capture:active { transform: scale(.92); }
+@media (max-width: 480px) {
+  .dock-btn { width: 38px; height: 38px; }
+  .dock { gap: 0 !important; padding-left: 6px; padding-right: 6px; }
+}
+@media (max-width: 400px) {
+  .dock-btn { width: 34px; height: 34px; }
+}
+@media (max-width: 360px) {
+  .dock-btn { width: 32px; height: 32px; }
+}
+
+@keyframes dock-capture-badge-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.35); opacity: 0.7; }
+}
+.dock-capture-badge {
+  animation: dock-capture-badge-pulse 1.6s ease-in-out infinite;
+}
+
+/* ---- toasts ---- */
+@keyframes toast-enter {
+  0% { transform: translateY(12px) scale(0.92); opacity: 0; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+@keyframes toast-exit {
+  0% { transform: translateY(0) scale(1); opacity: 1; }
+  100% { transform: translateY(12px) scale(0.92); opacity: 0; }
+}
+.toast-notification {
+  border-radius: 9999px;
+  padding: 12px 16px;
+  max-width: 360px;
+  animation: toast-enter 0.25s var(--ease);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toast-notification.toast-exit {
+  animation: toast-exit 0.15s cubic-bezier(0.7, 0, 0.84, 0);
+}
+
+/* Safari zooms the whole page when you focus a field under 16px. The Tailwind
+   size classes on those fields are more specific than a bare element selector,
+   so this has to shout — and only on phone widths, where the zoom happens and
+   the designed scale matters least. */
+@media (max-width: 820px) {
+  input, select, textarea { font-size: 16px !important; }
+}
