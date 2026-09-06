@@ -3,7 +3,8 @@ import {
   Camera, Plus, Trash2, Check, Send, Loader2, RotateCcw, X, LogOut, Mail, Pencil, ArrowLeftRight, ChevronDown, User,
   ArrowUpRight, ArrowDownRight, Paperclip, FileText, Sun, Moon, Download, MessageSquare, Repeat,
   LayoutGrid, Receipt, TrendingUp, FileClock, Coins, CalendarDays, Plug, Lock, StickyNote,
-  Search, Sparkles, AlertTriangle, Info, ChevronRight, Copy, History
+  Search, Sparkles, AlertTriangle, Info, ChevronRight, ChevronLeft, Copy, History,
+  MessageCircle, BarChart3
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
 import * as db from "./lib/db";
@@ -11,7 +12,7 @@ import * as bank from "./lib/bank";
 import { jsPDF } from "jspdf";
 import { askClaude, friendlyError } from "./lib/extract";
 import { parseEntryText, normalizeDraft, coerceAmount, coerceDate, todayLocal } from "./lib/parse";
-import { addInterval, occurrencesBetween } from "./lib/analysis";
+import { addInterval, occurrencesBetween, obligationsView, recurringCosts } from "./lib/analysis";
 import {
   proposeMatches, explainDelta, clearedIndex, consolidationPlan,
   findDuplicateEntries, findDuplicateBankLines, likelyAlreadyInBooks, signatureOf,
@@ -24,44 +25,22 @@ import {
 } from "./lib/cra";
 import { GUIDES, guideOpener } from "./lib/guides";
 import { ToastContainer } from "./components/Toast";
+import { Rail } from "./shell/Rail";
 import { notify, createNotification } from "./lib/notifications";
+import {
+  P, PALETTES, elev, R, MONO, SANS, SERIF, applyThemeVars, THEME_KEY,
+  Card, cardStyle, Panel, SectionHeading, Stat,
+  Btn, IconButton,
+  Label, Input, CodeInput, Textarea, Select, Checkbox, CONTROL,
+  Modal, ModalBody,
+  Pill, Segmented,
+  EmptyState,
+  Bone, LedgerSkeleton, Spinner, LoadingLine,
+  Reveal,
+} from "./ui";
 
-/* ================= palettes: midnight & daylight ledger ================= */
-const PALETTES = {
-  dark: {
-    bg: "#101613",
-    surface: "#171F1B",
-    surface2: "#1D2622",
-    line: "#2A3530",
-    text: "#F3F1E7",
-    muted: "#AEB5A9",
-    faint: "#7C847B",
-    credit: "#6FCB97",
-    debit: "#E0705F",
-    brass: "#F2B94A",
-    overlay: "rgba(6,10,8,0.75)",
-  },
-  light: {
-    bg: "#F5F3EC",            // warm paper, a touch brighter so cards don't glare against it
-    surface: "#FAF8F1",       // soft cream instead of near-white
-    surface2: "#EDEAE0",
-    line: "#E0DCCE",          // hairlines recede instead of gridding the page
-    text: "#2A2F27",          // soft ink, not black
-    muted: "#59604F",
-    faint: "#83887A",
-    credit: "#2E7D54",        // calmer green
-    debit: "#B0523F",         // terracotta instead of alarm red
-    brass: "#B8860B",
-    overlay: "rgba(52,56,46,0.38)",
-  },
-};
-// Mutable palette object, every component reads P at render time, so swapping
-// its values and re-rendering the tree re-themes the whole app.
-const P = { ...PALETTES.dark };
-const MONO = "'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-const SERIF = "'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif"; // display: soft sans, headings pick up weight via CSS
-const SANS = "'Plus Jakarta Sans', ui-sans-serif, system-ui, -apple-system, sans-serif";
-
+/* Palette, elevation, radii, and type all live in src/ui/tokens.js now, and
+   the primitives that read them live alongside. This file imports both. */
 
 /* ================= helpers ================= */
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -178,67 +157,91 @@ function downloadCSV(filename, rows) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
-/* ================= tiny UI atoms ================= */
-const Label = ({ children }) => (
-  <div style={{ color: P.muted, fontFamily: MONO, letterSpacing: "0.12em" }} className="text-xs uppercase mb-1">
-    {children}
-  </div>
-);
+/* ================= confirm =================
+   Replaces window.confirm, which drops an unstyled OS dialog on top of the
+   ledger and cannot say which ledger it is about to wipe. Promise-based so
+   callers keep reading top-to-bottom: `if (!(await askConfirm(...))) return;`. */
+let confirmHandler = null;
+const askConfirm = (opts) =>
+  new Promise((resolve) => {
+    // No host mounted (an early-boot path, say) — fall back rather than hang.
+    if (!confirmHandler) return resolve(window.confirm(opts.body || opts.title));
+    confirmHandler({ ...opts, resolve });
+  });
 
-const Input = (props) => (
-  <input
-    {...props}
-    style={{ background: P.bg, border: `1px solid ${P.line}`, color: P.text, ...props.style }}
-    className={"rounded px-2 py-1.5 text-sm w-full outline-none " + (props.className || "")}
-  />
-);
+function ConfirmHost() {
+  const [req, setReq] = useState(null);
+  const confirmRef = useRef(null);
 
-const Select = ({ children, ...props }) => (
-  <select
-    {...props}
-    style={{ background: P.bg, border: `1px solid ${P.line}`, color: P.text }}
-    className="rounded px-2 py-1.5 text-sm w-full outline-none"
-  >
-    {children}
-  </select>
-);
+  useEffect(() => {
+    confirmHandler = setReq;
+    return () => { confirmHandler = null; };
+  }, []);
 
-const Btn = ({ children, tone = "brass", ...props }) => {
-  const bg = tone === "brass" ? P.brass : tone === "credit" ? P.credit : tone === "debit" ? P.debit : P.surface2;
-  const fg = tone === "ghost" ? P.text : "#10120C";
+  useEffect(() => {
+    if (req) confirmRef.current?.focus();
+  }, [req]);
+
+  if (!req) return null;
+  const settle = (answer) => { req.resolve(answer); setReq(null); };
+  const danger = req.tone !== "normal"; // destructive is the common case here
+
   return (
-    <button
-      {...props}
-      style={{ background: bg, color: fg, border: tone === "ghost" ? `1px solid ${P.line}` : "none" }}
-      className={"rounded px-3 py-1.5 text-sm font-medium inline-flex items-center gap-1.5 disabled:opacity-40 " + (props.className || "")}
+    <Modal
+      onClose={() => settle(false)}
+      size="sm"
+      showClose={false}
+      labelledBy="confirm-title"
+      footer={
+        <>
+          <Btn tone="ghost" onClick={() => settle(false)}>{req.cancelLabel || "Cancel"}</Btn>
+          <Btn ref={confirmRef} tone={danger ? "debit" : "brass"} onClick={() => settle(true)}>
+            {req.confirmLabel || "Confirm"}
+          </Btn>
+        </>
+      }
     >
-      {children}
-    </button>
+      <ModalBody className="flex items-start gap-3.5 pt-5">
+        <div
+          className="shrink-0 flex items-center justify-center"
+          style={{
+            width: 38, height: 38, borderRadius: R.control,
+            background: (danger ? P.debit : P.brass) + "1f",
+            color: danger ? P.debit : P.brass,
+          }}
+        >
+          <AlertTriangle size={17} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h2 id="confirm-title" style={{ fontFamily: SERIF, color: P.text }} className="text-lg mb-1 text-balance">
+            {req.title}
+          </h2>
+          {req.body && (
+            <p style={{ color: P.muted, maxWidth: "58ch" }} className="text-sm text-pretty">
+              {req.body}
+            </p>
+          )}
+        </div>
+      </ModalBody>
+    </Modal>
   );
-};
+}
 
 /* one-time vs recurring */
 const isRec = (x) => x?.recurrence === "recurring";
 const RecToggle = ({ value, onChange }) => (
-  <div className="flex gap-1">
-    {[["once", "One-time"], ["recurring", "Recurring"]].map(([k, label]) => (
-      <button
-        key={k}
-        type="button"
-        onClick={() => onChange(k)}
-        style={{
-          background: value === k ? P.surface2 : "transparent",
-          border: `1px solid ${value === k ? P.brass : P.line}`,
-          color: value === k ? P.text : P.muted,
-        }}
-        className="flex-1 rounded px-2 py-1 text-xs inline-flex items-center justify-center gap-1"
-      >
-        {k === "recurring" && <Repeat size={11} />} {label}
-      </button>
-    ))}
-  </div>
+  <Segmented
+    full
+    size="sm"
+    value={value}
+    onChange={onChange}
+    options={[
+      { value: "once", label: "One-time" },
+      { value: "recurring", label: "Recurring", icon: <Repeat size={11} /> },
+    ]}
+  />
 );
-const RecMark = () => <Repeat size={11} style={{ color: P.brass, display: "inline", verticalAlign: "-1px" }} title="Recurring" />;
+const RecMark = () => <Repeat size={11} style={{ color: P.brassText, display: "inline", verticalAlign: "-1px" }} title="Recurring" />;
 
 /* subcategory dropdown, lists the category's subs and lets you add a new one inline */
 const subsFor = (data, type, category) =>
@@ -246,23 +249,55 @@ const subsFor = (data, type, category) =>
 
 function SubPicker({ data, type, category, value, onChange, addSub, compact }) {
   const subs = subsFor(data, type, category);
+  // Adding a subcategory happens in place: the select becomes a text field
+  // right where it stood, instead of throwing an OS prompt over the ledger.
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef(null);
+
+  useEffect(() => { if (adding) inputRef.current?.focus(); }, [adding]);
+
+  const cancel = () => { setAdding(false); setDraft(""); };
+  const commit = () => {
+    const name = draft.trim();
+    if (!name) return cancel();
+    if (!subs.includes(name)) addSub(type, category, name);
+    onChange(name);
+    cancel();
+  };
+
   const handle = (v) => {
-    if (v === "__add__") {
-      const name = window.prompt(`New subcategory under ${category}:`);
-      if (name && name.trim()) {
-        addSub(type, category, name.trim());
-        onChange(name.trim());
-      }
-      return;
-    }
+    if (v === "__add__") { setDraft(""); setAdding(true); return; }
     onChange(v);
   };
+
+  const shape = compact ? "rounded px-1 py-0.5 text-xs w-24" : "rounded px-2 py-1.5 text-sm w-full outline-none";
+
+  if (adding) {
+    return (
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        }}
+        placeholder={compact ? "name" : `new subcategory under ${category}`}
+        aria-label={`New subcategory under ${category}`}
+        style={{ background: P.bg, border: `1px solid ${P.brass}`, color: P.text }}
+        className={shape + " outline-none"}
+      />
+    );
+  }
+
   return (
     <select
       value={value && subs.includes(value) ? value : value || ""}
       onChange={(e) => handle(e.target.value)}
       style={{ background: P.bg, border: `1px solid ${P.line}`, color: value ? P.text : P.faint }}
-      className={compact ? "rounded px-1 py-0.5 text-xs w-24" : "rounded px-2 py-1.5 text-sm w-full outline-none"}
+      className={shape}
       title="Subcategory"
     >
       <option value="">{compact ? "sub" : "no subcategory"}</option>
@@ -292,19 +327,73 @@ const creditsTotalRemaining = (data) => (data.credits || []).reduce((s, c) => s 
 
 /* one "Paid via" selector everywhere: cash, each pool (with remaining), or create a pool inline */
 function PayViaSelect({ data, payMethod, creditId, onChange, addCredit }) {
+  // A new pool needs two answers, so it expands into a two-field row under the
+  // select rather than firing two OS prompts back to back.
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const [amount, setAmount] = useState("");
+  const nameRef = useRef(null);
+
+  useEffect(() => { if (adding) nameRef.current?.focus(); }, [adding]);
+
+  const cancel = () => { setAdding(false); setName(""); setAmount(""); };
+  const amt = parseFloat(amount);
+  const valid = name.trim() && !Number.isNaN(amt);
+  const commit = () => {
+    if (!valid) return;
+    const id = addCredit(name.trim(), Math.abs(amt));
+    onChange("credits", id);
+    cancel();
+  };
+
   const handle = (v) => {
     if (v === "cash") return onChange("cash", null);
-    if (v === "__addpool__") {
-      const name = window.prompt("Credit pool name (e.g. MongoDB credits):");
-      if (!name || !name.trim()) return;
-      const amt = parseFloat(window.prompt(`How many credits did ${name.trim()} grant? (number)`) || "");
-      if (Number.isNaN(amt)) return;
-      const id = addCredit(name.trim(), Math.abs(amt));
-      onChange("credits", id);
-      return;
-    }
+    if (v === "__addpool__") return setAdding(true);
     onChange("credits", v);
   };
+
+  if (adding) {
+    return (
+      <div
+        style={{ background: P.bg, border: `1px solid ${P.brass}` }}
+        className="rounded-lg p-2.5 space-y-2"
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        }}
+      >
+        <div className="flex gap-2">
+          <input
+            ref={nameRef}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Pool name"
+            aria-label="Credit pool name"
+            style={{ background: P.surface, border: `1px solid ${P.line}`, color: P.text }}
+            className="rounded px-2 py-1.5 text-sm flex-1 min-w-0 outline-none"
+          />
+          <input
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            inputMode="decimal"
+            placeholder="Granted"
+            aria-label="Credits granted"
+            style={{ background: P.surface, border: `1px solid ${P.line}`, color: P.text, fontFamily: MONO }}
+            className="rounded px-2 py-1.5 text-sm w-28 tabular-nums outline-none"
+          />
+        </div>
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={cancel} style={{ color: P.muted }} className="text-xs px-2 py-1">
+            Cancel
+          </button>
+          <Btn type="button" onClick={commit} disabled={!valid} className="!px-2.5 !py-1 !text-xs">
+            <Check size={12} /> Add pool
+          </Btn>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <Select value={payMethod === "credits" ? creditId || "" : "cash"} onChange={(e) => handle(e.target.value)}>
       <option value="cash">Cash / bank</option>
@@ -400,42 +489,100 @@ class Boundary extends React.Component {
   static getDerivedStateFromError(err) { return { err }; }
   render() {
     if (!this.state.err) return this.props.children;
+    // Reads the palette like everything else. It used to hardcode the dark
+    // hexes, so the one screen someone sees on their worst day was the one
+    // screen that ignored their theme.
     return (
-      <div style={{ background: "#101613", color: "#EAE7DA", minHeight: "100vh", fontFamily: SANS }} className="flex items-center justify-center p-6">
-        <div style={{ maxWidth: 480 }}>
-          <h1 style={{ fontFamily: "ui-serif, Georgia, serif" }} className="text-xl mb-2">Something broke</h1>
-          <p style={{ color: "#8B9389" }} className="text-sm mb-3">
-            The app hit an error instead of rendering. Reloading usually clears it, if it keeps happening, send this to whoever maintains the app:
+      <div style={{ background: P.bg, color: P.text, minHeight: "100dvh", fontFamily: SANS }} className="flex items-center justify-center p-6">
+        <Card level={3} className="w-full" style={{ maxWidth: 480 }}>
+          <div className="eyebrow mb-2">Unhandled error</div>
+          <h1 style={{ fontFamily: SERIF }} className="text-xl mb-2">Something broke</h1>
+          <p style={{ color: P.muted }} className="text-sm mb-4">
+            The app hit an error instead of rendering. Reloading usually clears it — if it keeps happening, send this to whoever maintains the app:
           </p>
-          <pre style={{ background: "#171F1B", border: "1px solid #2A3530", color: "#C4574E", whiteSpace: "pre-wrap" }} className="rounded p-3 text-xs mb-4">{String(this.state.err)}</pre>
-          <button onClick={() => window.location.reload()} style={{ background: "#F2B94A", color: "#10120C" }} className="rounded px-4 py-2 text-sm font-medium">Reload</button>
-        </div>
+          <Panel
+            as="pre"
+            className="text-xs mb-5 overflow-x-auto"
+            style={{ color: P.debit, whiteSpace: "pre-wrap", fontFamily: MONO }}
+          >
+            {String(this.state.err)}
+          </Panel>
+          <Btn onClick={() => window.location.reload()}>Reload</Btn>
+        </Card>
       </div>
     );
   }
 }
 
 /* ================= auth gate ================= */
+// Where a sign-in email has to land. The books live under /app/, so the redirect
+// must name that path: pointing it at the bare origin drops people on the
+// marketing page holding the token, which is why signing in took two clicks.
+const appUrl = () => {
+  const prodUrl = "https://brasstally.com";
+  const isDev = window.location.origin !== prodUrl && !window.location.hostname.includes("brasstally.com");
+  const baseUrl = isDev ? prodUrl : window.location.origin;
+  return `${baseUrl}/app/`;
+};
+
+// An installed PWA gets its own storage jar on iOS, so a link opened from Mail
+// signs you in inside Safari while the home-screen app still looks signed out.
+// A typed code is the only handoff that crosses that boundary.
+const isInstalledApp = () => {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia?.("(display-mode: standalone)")?.matches === true || window.navigator?.standalone === true;
+};
+
+// Supabase returns the session in the URL (hash for magic links, ?code= for
+// PKCE). Read any failure it reports, then scrub the params once the client has
+// consumed them so a refresh or a shared URL can't replay a spent token.
+const readLinkError = () => {
+  if (typeof window === "undefined") return "";
+  const hash = new URLSearchParams((window.location.hash || "").replace(/^#/, ""));
+  const query = new URLSearchParams(window.location.search || "");
+  const raw = hash.get("error_description") || query.get("error_description") || "";
+  if (!raw) return "";
+  return /expired|invalid/i.test(raw)
+    ? "That sign-in link has already been used or has expired. Enter your email below and we'll send a fresh code."
+    : raw;
+};
+
+const scrubAuthParams = () => {
+  if (typeof window === "undefined") return;
+  const hash = window.location.hash || "";
+  const query = new URLSearchParams(window.location.search || "");
+  const hadHash = /access_token|refresh_token|error_description|error_code/.test(hash);
+  const hadQuery = ["code", "error_description", "error", "error_code", "token_hash"].some((k) => query.has(k));
+  if (!hadHash && !hadQuery) return;
+  ["code", "error_description", "error", "error_code", "token_hash", "type"].forEach((k) => query.delete(k));
+  const search = query.toString();
+  window.history.replaceState({}, "", window.location.pathname + (search ? `?${search}` : ""));
+};
+
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = checking, null = signed out
   const [recovery, setRecovery] = useState(false);   // arrived via a password-reset link
+  const [linkError, setLinkError] = useState(readLinkError);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    // getSession() waits on the client's own init, which is what parses the URL,
+    // so by the time it resolves the token in the address bar is already spent.
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session ?? null);
+      scrubAuthParams();
+    });
     const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
       setSession(s);
       if (event === "PASSWORD_RECOVERY") setRecovery(true);
+      if (s) { setLinkError(""); scrubAuthParams(); }
     });
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  if (session === undefined)
-    return (
-      <div style={{ background: P.bg, color: P.muted, minHeight: "100vh" }} className="flex items-center justify-center">
-        <Loader2 className="animate-spin mr-2" size={18} /> Connecting…
-      </div>
-    );
-  if (!session) return <AuthScreen />;
+  // The same skeleton the ledger uses, rather than a spinner on an empty page:
+  // whichever way this resolves, the shape on screen is the one being filled.
+  if (session === undefined) return <LedgerSkeleton label="Connecting…" />;
+  if (!session) return <AuthScreen linkError={linkError} />;
   if (recovery) return <SetNewPassword onDone={() => setRecovery(false)} />;
   return (
     <Boundary>
@@ -446,138 +593,244 @@ export default function App() {
 
 function AuthCard({ children }) {
   return (
-    <div style={{ background: P.bg, color: P.text, minHeight: "100vh", fontFamily: SANS }} className="flex items-center justify-center p-4">
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-6 w-full max-w-sm">
-        <div style={{ fontFamily: MONO, color: P.brass }} className="text-xs uppercase tracking-widest">Down to brass tacks</div>
-        <img src="/app/brasstally-wordmark.png" alt="Brasstally" className="mb-4" style={{ height: 28, width: "auto", display: "block" }} />
+    <div style={{ background: P.bg, color: P.text, minHeight: "100dvh", fontFamily: SANS }} className="flex items-center justify-center p-4">
+      <div style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="p-7 w-full max-w-sm">
+        <div className="eyebrow mb-2">Down to brass tacks</div>
+        {/* Set rather than placed: the wordmark artwork is cream, drawn for the
+            dark ledger, and disappeared into the paper of the light theme.
+            Typed in the heading face it follows the palette either way. */}
+        <div style={{ fontFamily: SERIF, color: P.text }} className="text-2xl leading-none">
+          Brass<span style={{ color: P.brassText }}>t</span>ally
+        </div>
         {children}
       </div>
     </div>
   );
 }
 
-function AuthScreen() {
-  const [mode, setMode] = useState("signin"); // signin | signup | magic | forgot
+function AuthScreen({ linkError = "" }) {
+  // step: email → code is the default road. Password is kept as a side door for
+  // people who already set one, and forgot hangs off it.
+  const [step, setStep] = useState("email"); // email | code | password | signup | forgot
   const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
+  const [err, setErr] = useState(linkError);
   const [notice, setNotice] = useState("");
+  const [resentAt, setResentAt] = useState(0);
+  const installed = useMemo(isInstalledApp, []);
 
-  const switchMode = (m) => { setMode(m); setErr(""); setNotice(""); setPw(""); setPw2(""); };
+  const goTo = (s) => { setStep(s); setErr(""); setNotice(""); setCode(""); setPw(""); setPw2(""); };
 
-  const go = async () => {
+  // One request sends both halves: a tappable link for whoever is reading mail
+  // on the same browser, and a six-digit code for everyone else — the installed
+  // app, a desktop inbox, a phone that opens links in a different browser.
+  const sendCode = async (resend = false) => {
     const em = email.trim();
     if (!em || busy) return;
     setErr(""); setNotice(""); setBusy(true);
     try {
-      if (mode === "signup") {
+      const { error } = await supabase.auth.signInWithOtp({
+        email: em,
+        options: { emailRedirectTo: appUrl(), shouldCreateUser: true },
+      });
+      if (error) { setErr(error.message); return; }
+      setStep("code");
+      setCode("");
+      if (resend) { setResentAt(Date.now()); setNotice(`A fresh code is on its way to ${em}.`); }
+    } finally { setBusy(false); }
+  };
+
+  const verifyCode = async () => {
+    const token = code.replace(/\D/g, "");
+    if (token.length < 6 || busy) return;
+    setErr(""); setBusy(true);
+    try {
+      const { error } = await supabase.auth.verifyOtp({ email: email.trim(), token, type: "email" });
+      if (error) {
+        setErr(/expired/i.test(error.message)
+          ? "That code has expired. Send a new one and try again."
+          : "That code doesn't match. Check the last email — codes expire after an hour.");
+      }
+      // On success the auth listener in App() swaps this screen out.
+    } finally { setBusy(false); }
+  };
+
+  const passwordGo = async () => {
+    const em = email.trim();
+    if (!em || busy) return;
+    setErr(""); setNotice(""); setBusy(true);
+    try {
+      if (step === "signup") {
         if (pw.length < 8) { setErr("Use at least 8 characters for your password."); return; }
         if (pw !== pw2) { setErr("The two passwords don't match."); return; }
         const { data, error } = await supabase.auth.signUp({
-          email: em, password: pw, options: { emailRedirectTo: window.location.origin },
+          email: em, password: pw, options: { emailRedirectTo: appUrl() },
         });
         if (error) setErr(error.message);
         else if (!data.session) setNotice(`Almost there. A verification link is on its way to ${em}. Tap it to confirm your email, then sign in here.`);
-      } else if (mode === "signin") {
+      } else if (step === "password") {
         const { error } = await supabase.auth.signInWithPassword({ email: em, password: pw });
         if (error) {
           setErr(/confirm/i.test(error.message)
             ? "This email isn't verified yet. Check your inbox for the verification link, then try again."
-            : "That email and password don't match. Reset the password below, or use a sign-in link instead.");
+            : "That email and password don't match. Reset it below, or go back and use a code instead.");
         }
-      } else if (mode === "magic") {
-        const { error } = await supabase.auth.signInWithOtp({ email: em, options: { emailRedirectTo: window.location.origin } });
-        if (error) setErr(error.message);
-        else setNotice(`Check ${em} for a one-tap sign-in link. It verifies your email automatically, and it works for new accounts too.`);
-      } else if (mode === "forgot") {
-        const { error } = await supabase.auth.resetPasswordForEmail(em, { redirectTo: window.location.origin });
+      } else if (step === "forgot") {
+        const { error } = await supabase.auth.resetPasswordForEmail(em, { redirectTo: appUrl() });
         if (error) setErr(error.message);
         else setNotice(`A password reset link is on its way to ${em}. It brings you back here to set a new one.`);
       }
     } finally { setBusy(false); }
   };
 
-  const linkStyle = { color: P.faint, fontFamily: MONO };
+  // Utility links read as text, not as terminal output — the mono face made
+  // them look like a config file.
+  const linkStyle = { color: P.muted };
+  const emailValid = /\S+@\S+\.\S+/.test(email.trim());
 
-  return (
-    <AuthCard>
-      {(mode === "signin" || mode === "signup") && (
-        <div className="flex gap-1 mb-4">
-          {[["signin", "Sign in"], ["signup", "Create account"]].map(([k, label]) => (
-            <button key={k} onClick={() => switchMode(k)}
-              style={{ fontFamily: MONO, background: mode === k ? P.surface2 : "transparent", border: `1px solid ${mode === k ? P.brass : P.line}`, color: mode === k ? P.text : P.muted }}
-              className="flex-1 rounded px-2 py-1.5 text-xs">
+  if (notice && step !== "code") {
+    return (
+      <AuthCard>
+        <p style={{ color: P.muted }} className="text-sm">{notice}</p>
+        <button onClick={() => goTo("email")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2 mt-3">back</button>
+      </AuthCard>
+    );
+  }
+
+  /* ---- step 2: type the code ---- */
+  if (step === "code") {
+    return (
+      <AuthCard>
+        <p style={{ color: P.text }} className="text-sm mt-3">
+          Enter the code we sent to <span style={{ fontFamily: MONO }}>{email.trim()}</span>.
+        </p>
+        <p style={{ color: P.muted }} className="text-xs mt-1">
+          {installed
+            ? "Typing the code signs you in right here in the app — tapping the link in your email would open a browser instead, and that signs in the browser, not the app."
+            : "The same email also has a one-tap link, if you'd rather use that."}
+        </p>
+
+        <input
+          value={code}
+          onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 10))}
+          onKeyDown={(e) => e.key === "Enter" && verifyCode()}
+          inputMode="numeric"
+          autoComplete="one-time-code"
+          autoFocus
+          maxLength={10}
+          aria-label="Sign-in code"
+          style={{ background: P.bg, border: `1px solid ${P.line}`, color: P.text, fontFamily: MONO, letterSpacing: "0.4em" }}
+          className="rounded-lg px-3 py-3 w-full outline-none text-center text-xl mt-4"
+        />
+
+        {err && <p style={{ color: P.debit }} className="text-xs mt-2">{err}</p>}
+        {notice && <p style={{ color: P.credit }} className="text-xs mt-2">{notice}</p>}
+
+        <Btn className="w-full justify-center mt-3" onClick={verifyCode} loading={busy} disabled={code.length < 6}>
+          {!busy && <Check size={14} />}
+          Sign in
+        </Btn>
+
+        <div className="flex justify-between mt-3">
+          <button onClick={() => sendCode(true)} disabled={busy || Date.now() - resentAt < 20000}
+            style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2 disabled:opacity-40">Send a new code</button>
+          <button onClick={() => goTo("email")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2">Use a different email</button>
+        </div>
+      </AuthCard>
+    );
+  }
+
+  /* ---- password side door ---- */
+  if (step === "password" || step === "signup" || step === "forgot") {
+    return (
+      <AuthCard>
+        <div className="flex gap-1 mt-3 mb-4">
+          {[["password", "Sign in"], ["signup", "Create account"]].map(([k, label]) => (
+            <button key={k} onClick={() => goTo(k)}
+              style={{ fontFamily: MONO, background: step === k ? P.surface2 : "transparent", border: `1px solid ${step === k ? P.brass : P.line}`, color: step === k ? P.text : P.muted }}
+              className="flex-1 rounded-lg px-2 py-2 text-xs">
               {label}
             </button>
           ))}
         </div>
-      )}
 
-      {notice ? (
-        <>
-          <p style={{ color: P.muted }} className="text-sm">{notice}</p>
-          <button onClick={() => setNotice("")} style={linkStyle} className="text-xs underline decoration-dotted mt-3">back</button>
-        </>
-      ) : (
-        <>
-          <Label>Email</Label>
-          <Input type="email" placeholder="you@example.com" value={email} autoComplete="email"
-            onChange={(e) => setEmail(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && (mode === "magic" || mode === "forgot") && go()} />
+        <Label>Email</Label>
+        <Input type="email" placeholder="you@example.com" value={email} autoComplete="email"
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && step === "forgot" && passwordGo()} />
 
-          {(mode === "signin" || mode === "signup") && (
-            <div className="mt-2">
-              <Label>Password</Label>
-              <Input type="password" placeholder={mode === "signup" ? "At least 8 characters" : "Your password"} value={pw}
-                autoComplete={mode === "signup" ? "new-password" : "current-password"}
-                onChange={(e) => setPw(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && mode === "signin" && go()} />
-            </div>
-          )}
-          {mode === "signup" && (
-            <div className="mt-2">
-              <Label>Password, again</Label>
-              <Input type="password" placeholder="Same password" value={pw2} autoComplete="new-password"
-                onChange={(e) => setPw2(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && go()} />
-            </div>
-          )}
-          {mode === "forgot" && (
-            <p style={{ color: P.muted }} className="text-xs mt-2">Enter your email and we'll send a link to set a new password.</p>
-          )}
-          {mode === "magic" && (
-            <p style={{ color: P.muted }} className="text-xs mt-2">No password needed. A one-tap link lands in your inbox and opens your books.</p>
-          )}
-
-          {err && <p style={{ color: P.debit }} className="text-xs mt-2">{err}</p>}
-
-          <Btn className="w-full justify-center mt-3" onClick={go}
-            disabled={busy || !email.trim() || ((mode === "signin" || mode === "signup") && !pw)}>
-            {busy ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
-            {mode === "signin" ? "Sign in" : mode === "signup" ? "Create account" : mode === "magic" ? "Send sign-in link" : "Send reset link"}
-          </Btn>
-
-          <div className="flex justify-between mt-3">
-            {mode !== "magic" ? (
-              <button onClick={() => switchMode("magic")} style={linkStyle} className="text-xs underline decoration-dotted">Email me a sign-in link instead</button>
-            ) : (
-              <button onClick={() => switchMode("signin")} style={linkStyle} className="text-xs underline decoration-dotted">Use a password instead</button>
-            )}
-            {mode === "signin" && (
-              <button onClick={() => switchMode("forgot")} style={linkStyle} className="text-xs underline decoration-dotted">Forgot password?</button>
-            )}
-            {(mode === "forgot") && (
-              <button onClick={() => switchMode("signin")} style={linkStyle} className="text-xs underline decoration-dotted">Back to sign in</button>
-            )}
+        {step !== "forgot" && (
+          <div className="mt-2">
+            <Label>Password</Label>
+            <Input type="password" placeholder={step === "signup" ? "At least 8 characters" : "Your password"} value={pw}
+              autoComplete={step === "signup" ? "new-password" : "current-password"}
+              onChange={(e) => setPw(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && step === "password" && passwordGo()} />
           </div>
+        )}
+        {step === "signup" && (
+          <div className="mt-2">
+            <Label>Password, again</Label>
+            <Input type="password" placeholder="Same password" value={pw2} autoComplete="new-password"
+              onChange={(e) => setPw2(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && passwordGo()} />
+          </div>
+        )}
+        {step === "forgot" && (
+          <p style={{ color: P.muted }} className="text-xs mt-2">Enter your email and we'll send a link to set a new password.</p>
+        )}
 
-          <p style={{ color: P.faint }} className="text-xs mt-4">
-            Verified email, encrypted connection, and your books are isolated to your account.
-          </p>
-        </>
-      )}
+        {err && <p style={{ color: P.debit }} className="text-xs mt-2">{err}</p>}
+
+        <Btn className="w-full justify-center mt-3" onClick={passwordGo}
+          loading={busy} disabled={!emailValid || (step !== "forgot" && !pw)}>
+          {!busy && <Lock size={14} />}
+          {step === "password" ? "Sign in" : step === "signup" ? "Create account" : "Send reset link"}
+        </Btn>
+
+        <div className="flex justify-between mt-3">
+          <button onClick={() => goTo("email")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2">Email me a code instead</button>
+          {step === "password" && (
+            <button onClick={() => goTo("forgot")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2">Forgot password?</button>
+          )}
+          {step === "forgot" && (
+            <button onClick={() => goTo("password")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2">Back to sign in</button>
+          )}
+        </div>
+      </AuthCard>
+    );
+  }
+
+  /* ---- step 1: email ---- */
+  return (
+    <AuthCard>
+      <p style={{ color: P.muted }} className="text-sm mt-3 mb-4">
+        Enter your email and we'll send a 6-digit code. New here? The same code creates your account.
+      </p>
+
+      <Label>Email</Label>
+      <Input type="email" placeholder="you@example.com" value={email} autoComplete="email" autoFocus
+        inputMode="email"
+        onChange={(e) => setEmail(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && emailValid && sendCode()} />
+
+      {err && <p style={{ color: P.debit }} className="text-xs mt-2">{err}</p>}
+
+      <Btn className="w-full justify-center mt-3" onClick={() => sendCode()} loading={busy} disabled={!emailValid}>
+        {!busy && <Mail size={14} />}
+        Email me a code
+      </Btn>
+
+      <div className="flex justify-between mt-3">
+        <button onClick={() => goTo("password")} style={linkStyle} className="text-xs underline decoration-dotted underline-offset-2">Use a password instead</button>
+      </div>
+
+      <p style={{ color: P.faint }} className="text-xs mt-4">
+        Verified email, encrypted connection, and your books are isolated to your account.
+      </p>
     </AuthCard>
   );
 }
@@ -609,8 +862,8 @@ function SetNewPassword({ onDone }) {
         <Input type="password" value={pw2} autoComplete="new-password" placeholder="Same password" onChange={(e) => setPw2(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} />
       </div>
       {err && <p style={{ color: P.debit }} className="text-xs mt-2">{err}</p>}
-      <Btn className="w-full justify-center mt-3" onClick={save} disabled={busy || !pw || !pw2}>
-        {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />} Save new password
+      <Btn className="w-full justify-center mt-3" onClick={save} loading={busy} disabled={!pw || !pw2}>
+        {!busy && <Check size={14} />} Save new password
       </Btn>
     </AuthCard>
   );
@@ -648,7 +901,8 @@ function Ledger({ onSignOut }) {
   const [chatSeed, setChatSeed] = useState(null); // { question, at } queued from an insight
   const [chatGuide, setChatGuide] = useState(null); // { id, at } a section handing over its brief
   const [chatNudge, setChatNudge] = useState(null); // { at, received, total } money landed, say so
-  const [chatUnread, setChatUnread] = useState(false); // Brasstally spoke proactively and nobody has looked yet
+  const [chatBrief, setChatBrief] = useState(null); // { at, insight } Tally opening the conversation unprompted
+  const [chatUnread, setChatUnread] = useState(false); // Tally spoke proactively and nobody has looked yet
   // Read by callbacks that fire after an await, when the closure's copy of
   // state is already a render behind.
   const dataRef = useRef(null);
@@ -716,6 +970,8 @@ function Ledger({ onSignOut }) {
         const loaded = await db.loadAll(currentLedger);
         const t = loaded.settings.theme === "light" ? "light" : "dark";
         Object.assign(P, PALETTES[t]);
+        applyThemeVars(P);
+        try { localStorage.setItem(THEME_KEY, t); } catch { /* private mode */ }
         setThemeState(t);
         setMonth(thisMonth());
         // OAuth banks bounce back to origin/; BankFeedCard only mounts on Connectors
@@ -897,6 +1153,41 @@ function Ledger({ onSignOut }) {
   );
   dataRef.current = data;
   balanceRef.current = balance;
+
+  /* ---- Tally opening the conversation ----
+     The findings in lib/insights.js are worked out on every render whether or
+     not anyone asks. If one of them needs a decision, saying so unprompted is
+     the entire difference between an assistant and a search box. One per
+     ledger per day, and only for something that actually needs the user: an
+     assistant that greets you every reload is noise, not help. */
+  const briefedFor = useRef(null);
+  const briefTimer = useRef(null);
+  const chatOpenRef = useRef(false);
+  chatOpenRef.current = chatOpen;
+  useEffect(() => () => clearTimeout(briefTimer.current), []);
+  useEffect(() => {
+    if (!data || briefedFor.current === data.ledger.id) return;
+    // insights arrive sorted by severity, then by money at stake, so the first
+    // one is the thing most worth saying without being asked.
+    const top = insights[0];
+    if (!top) return;
+    briefedFor.current = data.ledger.id;
+    const key = `tally:brief:${data.ledger.id}`;
+    const stamp = `${todayStr()}:${top.id}`;
+    try {
+      if (window.localStorage.getItem(key) === stamp) return; // already said this today
+      window.localStorage.setItem(key, stamp);
+    } catch { /* private mode: speak anyway */ }
+    // Let the ledger finish painting first, so this reads as Tally noticing
+    // something rather than as part of the page loading. The timer is not tied
+    // to this effect's lifetime: insights recompute the moment the bank feed
+    // lands, and a cleanup here would swallow the message before it arrives.
+    briefTimer.current = setTimeout(() => {
+      setChatBrief({ at: Date.now(), insight: top });
+      if (!chatOpenRef.current) setChatUnread(true);
+    }, 1400);
+  }, [data?.ledger.id, insights]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // A question queued for the chat panel by something else in the app.
   const askAgent = (question) => { setChatSeed({ question, at: Date.now() }); setChatOpen(true); };
   // A section handing the chat its own brief, so help arrives already knowing
@@ -909,34 +1200,26 @@ function Ledger({ onSignOut }) {
 
   if (fatal === "migration")
     return (
-      <div style={{ background: P.bg, color: P.text, minHeight: "100vh" }} className="flex items-center justify-center p-6">
-        <div style={{ maxWidth: 460 }}>
+      <div style={{ background: P.bg, color: P.text, minHeight: "100dvh" }} className="flex items-center justify-center p-6">
+        <Card level={3} className="w-full" style={{ maxWidth: 460 }}>
+          <div className="eyebrow mb-2">Setup</div>
           <h1 style={{ fontFamily: SERIF }} className="text-xl mb-2">One migration to run</h1>
           <p style={{ color: P.muted }} className="text-sm">
             This version stores everything in ledgers, and the database doesn't have the ledgers table yet.
-            Run <span style={{ fontFamily: MONO, color: P.brass }}>supabase/migration-multi-ledger.sql</span> in the
+            Run <span style={{ fontFamily: MONO, color: P.brassText }}>supabase/migration-multi-ledger.sql</span> in the
             Supabase SQL Editor, then reload. Your existing data is moved into a "GENIE AI" ledger automatically.
           </p>
-        </div>
+          <Btn className="mt-5" onClick={() => window.location.reload()}>Reload</Btn>
+        </Card>
       </div>
     );
 
-  if (ledgers === null)
-    return (
-      <div style={{ background: P.bg, color: P.muted, minHeight: "100vh" }} className="flex items-center justify-center">
-        <Loader2 className="animate-spin mr-2" size={18} /> Finding your ledgers…
-      </div>
-    );
+  if (ledgers === null) return <LedgerSkeleton label="Finding your ledgers…" />;
 
   if (ledgers.length === 0)
     return <NewLedgerModal onboarding onCreate={createLedgerAndSwitch} onClose={() => {}} onSignOut={onSignOut} />;
 
-  if (!data)
-    return (
-      <div style={{ background: P.bg, color: P.muted, minHeight: "100vh" }} className="flex items-center justify-center">
-        <Loader2 className="animate-spin mr-2" size={18} /> Opening the ledger…
-      </div>
-    );
+  if (!data) return <LedgerSkeleton label="Opening the ledger…" />;
 
   /* ---- mutations: update state, then write through to Supabase ---- */
   // Adding an entry moves the view to that entry's month, so the ledger line,
@@ -959,10 +1242,15 @@ function Ledger({ onSignOut }) {
         ? { ...b, status: "unmatched", matchedTxId: null, matchSource: null }
         : b));
 
-  const delTx = (id) => {
+  const delTx = async (id) => {
     const t = data.transactions.find((x) => x.id === id);
     if (t?.transferId) {
-      if (!window.confirm("This entry is one side of an inter-ledger transfer. Removing it deletes BOTH sides (here and in the other ledger). Continue?")) return;
+      const ok = await askConfirm({
+        title: "Remove both sides of this transfer?",
+        body: "This entry is one side of an inter-ledger transfer. Removing it deletes the matching entry in the other ledger too.",
+        confirmLabel: "Remove both",
+      });
+      if (!ok) return;
       const gone = data.transactions.filter((x) => x.transferId === t.transferId).map((x) => x.id);
       setData((d) => ({ ...d, transactions: d.transactions.filter((x) => x.transferId !== t.transferId) }));
       dropMatchesFor(gone);
@@ -1142,9 +1430,16 @@ function Ledger({ onSignOut }) {
     dbTry(() => db.deleteObligation(id));
   };
   // Undo a settlement: remove the settled obligation AND the transaction it created.
-  const removeSettled = (kind, item) => {
+  const removeSettled = async (kind, item) => {
     if (inFlight.current.has(item.id)) return;
-    if (!window.confirm(`Remove this settled ${kind === "receivables" ? "receivable" : "payable"} and the transaction it logged? Use this to clear a mistaken or duplicate settlement.`)) return;
+    const noun = kind === "receivables" ? "receivable" : "payable";
+    const ok = await askConfirm({
+      title: `Reverse this settled ${noun}?`,
+      body: `Removes the ${noun} and the transaction it logged. Use this to clear a mistaken or duplicate settlement.`,
+      confirmLabel: "Reverse settlement",
+    });
+    if (!ok) return;
+    if (inFlight.current.has(item.id)) return; // a second click may have landed while the dialog was open
     inFlight.current.add(item.id);
     setTimeout(() => inFlight.current.delete(item.id), 1500);
 
@@ -1175,7 +1470,12 @@ function Ledger({ onSignOut }) {
     });
   };
   const resetAll = async () => {
-    if (!window.confirm(`Wipe "${data.ledger.name}" and start it fresh? Every entry, receivable, and credit pool in THIS ledger will be removed. Other ledgers are untouched.`)) return;
+    const ok = await askConfirm({
+      title: `Wipe "${data.ledger.name}" and start it fresh?`,
+      body: "Every entry, receivable, and credit pool in this ledger will be removed. Your other ledgers are untouched. This cannot be undone.",
+      confirmLabel: "Wipe this ledger",
+    });
+    if (!ok) return;
     setData(null);
     try { await db.resetLedger(data.ledger.kind); } catch (e) { console.error(e); }
     window.location.reload();
@@ -1349,6 +1649,11 @@ function Ledger({ onSignOut }) {
 
   const setTheme = (t) => {
     Object.assign(P, PALETTES[t]);
+    // Mirror onto the document root so stylesheet rules follow the swap, and
+    // into storage so the next load — and the landing page, which reads the
+    // same key — paints the right theme before any JS runs.
+    applyThemeVars(P);
+    try { localStorage.setItem(THEME_KEY, t); } catch { /* private mode */ }
     setThemeState(t);
     setData((d) => ({ ...d, settings: { ...d.settings, theme: t } }));
     dbTry(() => db.setTheme(t));
@@ -1372,17 +1677,35 @@ function Ledger({ onSignOut }) {
     ["credits", "Credits", Coins],
     ["calendar", "Calendar", CalendarDays],
     ["integrations", "Connectors", Plug],
+    ["reports", "Reports", BarChart3],
   ];
 
   return (
-    <div style={{ background: P.bg, color: P.text, minHeight: "100vh", fontFamily: SANS }}>
-      <div className="max-w-5xl mx-auto px-4" style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))" }}>
+    <div style={{ background: P.bg, color: P.text, minHeight: "100dvh", fontFamily: SANS, "--ring": P.brass }}
+         className="flex">
+      {/* Navigation lives in a rail on desktop, so it stops competing with the
+          ledger. Below lg it disappears and the dock at the bottom takes over,
+          because a 74px column on a phone eats a fifth of the width and puts
+          the sections out of thumb reach. */}
+      <Rail
+        tabs={tabs}
+        tab={tab}
+        setTab={(k) => { setTab(k); setChatOpen(false); }}
+        ledgers={ledgers || []}
+        ledger={data.ledger}
+        onPickLedger={(l) => { if (l.id !== data.ledger.id) setCurrentLedger(l); }}
+        onNewLedger={() => setNewLedgerOpen(true)}
+        onAccount={() => setAccountOpen(true)}
+        accountActive={accountOpen}
+      />
+      <div className="flex-1 min-w-0">
+      {/* The ledger is a reading surface, so it stops widening past the point
+          where a row's date and its amount stop being one glance apart. */}
+      <div className="px-4 w-full mx-auto max-w-[1180px]" style={{ paddingBottom: "calc(112px + env(safe-area-inset-bottom, 0px))" }}>
         {/* ===== header ===== */}
-        <header className="pt-6 pb-4 flex flex-wrap items-end justify-between gap-3">
+        <header className="pt-6 pb-5 flex flex-wrap items-end justify-between gap-3">
           <div>
-            <div style={{ fontFamily: MONO, color: P.text }} className="text-xs uppercase tracking-widest">
-              Brasstally
-            </div>
+            <div className="eyebrow">Brasstally</div>
             <div className="flex items-center gap-3 min-w-0">
               <div className="relative min-w-0">
                 <button
@@ -1391,14 +1714,14 @@ function Ledger({ onSignOut }) {
                   className="flex items-center gap-1.5 text-left min-w-0 max-w-[70vw] sm:max-w-xs"
                 >
                   <h1 style={{ fontFamily: SERIF }} className="text-3xl leading-tight truncate">{data.ledger.name}</h1>
-                  <ChevronDown size={20} style={{ color: P.brass, transform: ledgerMenuOpen ? "rotate(180deg)" : "none", transition: "transform .15s" }} className="shrink-0" />
+                  <ChevronDown size={20} style={{ color: P.brassText, transform: ledgerMenuOpen ? "rotate(180deg)" : "none", transition: "transform .15s" }} className="shrink-0" />
                 </button>
                 {ledgerMenuOpen && (
                   <>
                     <div className="fixed inset-0 z-40" onClick={() => setLedgerMenuOpen(false)} />
                     <div
-                      style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: "0 12px 32px rgba(0,0,0,0.35)" }}
-                      className="absolute left-0 top-full mt-2 rounded-lg z-50 min-w-56 overflow-hidden py-1"
+                      style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(2), borderRadius: R.card }}
+                      className="absolute left-0 top-full mt-2 z-50 min-w-56 overflow-hidden py-1"
                     >
                       {ledgers.map((l) => (
                         <button
@@ -1409,14 +1732,14 @@ function Ledger({ onSignOut }) {
                         >
                           <span className="truncate">{l.name}</span>
                           {l.id === data.ledger.id
-                            ? <Check size={14} style={{ color: P.brass }} className="shrink-0" />
+                            ? <Check size={14} style={{ color: P.brassText }} className="shrink-0" />
                             : <span style={{ fontFamily: MONO, color: P.faint }} className="text-xs shrink-0">{kindLabel(l.kind).split(" ")[0]}</span>}
                         </button>
                       ))}
                       <div style={{ borderTop: `1px solid ${P.line}` }} className="mt-1 pt-1">
                         <button
                           onClick={() => { setLedgerMenuOpen(false); setNewLedgerOpen(true); }}
-                          style={{ color: P.brass, fontFamily: MONO }}
+                          style={{ color: P.brassText, fontFamily: MONO }}
                           className="w-full text-left px-3 py-2 text-xs"
                         >
                           + new ledger…
@@ -1426,31 +1749,46 @@ function Ledger({ onSignOut }) {
                   </>
                 )}
               </div>
-              <span style={{ fontFamily: MONO, color: P.brass, border: `1px solid ${P.brass}` }} className="rounded-full px-2 py-0.5 text-xs whitespace-nowrap">
-                {kindLabel(data.ledger.kind)}
-              </span>
+              <Pill tone="brass" mono>{kindLabel(data.ledger.kind)}</Pill>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <button
+            <Btn
+              tone="ghost"
+              size="sm"
               onClick={() => setAccountOpen(true)}
               title="Profile, membership, and settings"
-              style={{ color: P.muted, border: `1px solid ${P.line}` }}
-              className="rounded p-2"
+              aria-label="Account"
+              style={{ color: P.muted, padding: 9 }}
             >
               <User size={15} />
-            </button>
-            <button
+            </Btn>
+            <Btn
+              tone="ghost"
+              size="sm"
               onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
               title={theme === "dark" ? "Switch to light" : "Switch to dark"}
-              style={{ color: P.muted, border: `1px solid ${P.line}` }}
-              className="rounded p-2"
+              aria-label={theme === "dark" ? "Switch to light" : "Switch to dark"}
+              style={{ color: P.muted, padding: 9 }}
             >
               {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-            </button>
-            <Btn tone="ghost" onClick={() => setMonth(shiftMonth(month, -1))}>‹</Btn>
-            <div style={{ fontFamily: MONO }} className="text-sm w-40 text-center">{monthLabel(month)}</div>
-            <Btn tone="ghost" onClick={() => setMonth(shiftMonth(month, 1))}>›</Btn>
+            </Btn>
+            {/* The month stepper reads as one control, not three: the label
+                sits between its arrows inside a single bordered well. */}
+            <div
+              className="flex items-center"
+              style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.pill }}
+            >
+              <IconButton label="Previous month" onClick={() => setMonth(shiftMonth(month, -1))} style={{ margin: 0, padding: "7px 10px", color: P.muted }}>
+                <ChevronLeft size={16} />
+              </IconButton>
+              <div style={{ fontFamily: MONO, color: P.text }} className="text-xs w-36 text-center tabular-nums">
+                {monthLabel(month)}
+              </div>
+              <IconButton label="Next month" onClick={() => setMonth(shiftMonth(month, 1))} style={{ margin: 0, padding: "7px 10px", color: P.muted }}>
+                <ChevronRight size={16} />
+              </IconButton>
+            </div>
           </div>
         </header>
 
@@ -1462,51 +1800,18 @@ function Ledger({ onSignOut }) {
           creditsLeft={(data.credits || []).length ? creditsTotalRemaining(data) : null}
           onCredits={() => setTab("credits")}
           onReconcile={() => (balance.source === "bank" ? setMatchOpen(true) : setReconciling(true))}
+          needsConsolidation={balance.source === "bank" && balance.delta != null && Math.abs(balance.delta) >= 0.01}
+          consolidationSettled={consolidation.settled}
+          onConsolidate={() => setMatchOpen(true)}
         />
 
         {/* ===== tabs ===== */}
-        <div className="mt-6 mb-6">
-          <h2 style={{ fontFamily: SERIF }} className="text-xl fade-in-key" key={tab}>
+        <div className="mt-8 mb-5 fade-in-key" key={tab}>
+          <div className="eyebrow mb-1.5">{monthLabel(month)}</div>
+          <h2 style={{ fontFamily: SERIF }} className="text-2xl">
             {tabs.find(([k]) => k === tab)?.[1]}
           </h2>
         </div>
-
-        {false && (
-          <div style={{ border: `1px solid ${P.debit}`, color: P.debit }} className="rounded p-2 text-sm mb-4">
-            Couldn't reach the database, the last change shows on screen but may not have saved. Check your connection and retry.
-          </div>
-        )}
-
-        {/* The gap is worth shouting about until it's been worked through, and
-            no longer once it has. A finished consolidation stays finished
-            across ledger switches and reloads — until the bank or the books
-            move, at which point this turns loud again by itself. */}
-        {balance.source === "bank" && balance.delta != null && Math.abs(balance.delta) >= 0.01 && (
-          <button
-            type="button"
-            onClick={() => setMatchOpen(true)}
-            style={{
-              border: `1px solid ${consolidation.settled ? P.line : P.debit}`,
-              color: consolidation.settled ? P.muted : P.debit,
-              background: "transparent",
-            }}
-            className="rounded p-2 text-sm mb-4 w-full text-left"
-          >
-            <span style={{ fontFamily: MONO }} className="text-xs">
-              Bank {fmt(balance.bank)} · books {fmt(balance.book)} · Δ {fmt(balance.delta)}
-              {balance.balanceAsOf ? ` as of ${String(balance.balanceAsOf).slice(0, 10)}` : ""}
-            </span>
-            <span className="block text-xs mt-0.5" style={{ color: consolidation.settled ? P.faint : P.muted }}>
-              {consolidation.settled
-                ? `Consolidated ${relDay(consolidation.last.createdAt)}. The gap is ${recon?.unexplained != null && Math.abs(recon.unexplained) >= 0.01 ? "as explained as it can be" : "fully accounted for"} by ${recon?.bankOnly.count || 0} bank ${(recon?.bankOnly.count || 0) === 1 ? "line" : "lines"} and ${recon?.bookOnly.count || 0} ${(recon?.bookOnly.count || 0) === 1 ? "entry" : "entries"} still open. Tap to review.`
-                : duplicates.length
-                  ? `${duplicates.length} possible ${duplicates.length === 1 ? "duplicate" : "duplicates"} in the books${recon ? `, ${recon.bankOnly.count} bank ${recon.bankOnly.count === 1 ? "line isn't" : "lines aren't"} recorded` : ""}. Tap to consolidate.`
-                  : recon && (recon.bankOnly.count || recon.bookOnly.count)
-                    ? `${recon.bankOnly.count} bank ${recon.bankOnly.count === 1 ? "line isn't" : "lines aren't"} in the books, ${recon.bookOnly.count} ${recon.bookOnly.count === 1 ? "entry hasn't" : "entries haven't"} cleared. Tap to pair them up.`
-                    : "Books and bank disagree. Tap to consolidate line by line."}
-            </span>
-          </button>
-        )}
 
         {!seenTours[tab] && !window.localStorage.getItem(`tour:${tab}`) && (
           <TourCard tab={tab} onDismiss={() => {
@@ -1539,21 +1844,37 @@ function Ledger({ onSignOut }) {
           setLedgers((ls) => ls.map((l) => (l.id === data.ledger.id ? { ...l, ...patch } : l)));
           dbTry(() => db.updateLedger(data.ledger.id, patch));
         }} />}
+        {tab === "reports" && <ReportsTab data={data} month={month} balance={balance} onAsk={askAgent} />}
         </div>
       </div>
 
-      {/* ===== floating Brasstally chat (stays mounted so the conversation survives closing) ===== */}
+      {/* ===== floating Tally chat (stays mounted so the conversation survives closing) ===== */}
       {/* capture panel floats above the dock */}
-      <div className="fixed z-40" style={{ right: "12px", bottom: "84px", width: "min(24rem, calc(100vw - 24px))", pointerEvents: chatOpen ? "auto" : "none" }}>
+      </div>
+
+      <div className="fixed z-40" style={{ right: "12px", bottom: "84px", width: "min(26rem, calc(100vw - 24px))", pointerEvents: chatOpen ? "auto" : "none" }}>
         <div className={"capture-pop " + (chatOpen ? "open" : "")}>
           <div
-            style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: "0 16px 48px rgba(0,0,0,0.45)" }}
+            style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3) }}
             className="rounded-lg overflow-hidden"
           >
-            <div className="flex items-center gap-2 px-3 py-2" style={{ borderBottom: `1px solid ${P.line}` }}>
-              <MessageSquare size={14} style={{ color: P.brass }} />
-              <div style={{ fontFamily: MONO }} className="text-xs uppercase tracking-widest flex-1">Brasstally</div>
-              <button onClick={() => setChatOpen(false)} style={{ color: P.muted }} className="p-1"><X size={15} /></button>
+            {/* Tally has a name and a face, because you talk to someone, not to
+                a feature. The brand stays in the header of the app. */}
+            <div className="flex items-center gap-2.5 px-3 py-2.5" style={{ borderBottom: `1px solid ${P.line}` }}>
+              <span
+                aria-hidden
+                style={{ background: P.brass + "22", border: `1px solid ${P.brass}`, color: P.brassText, fontFamily: SERIF, width: 28, height: 28 }}
+                className="rounded-full text-sm flex items-center justify-center shrink-0"
+              >
+                T
+              </span>
+              <div className="flex-1 min-w-0 leading-tight">
+                <div style={{ color: P.text }} className="text-sm">Tally</div>
+                <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs truncate">
+                  {data.ledger.name} · your bookkeeper
+                </div>
+              </div>
+              <button onClick={() => setChatOpen(false)} aria-label="Close" style={{ color: P.muted }} className="p-1"><X size={15} /></button>
             </div>
             <Capture
               key={data.ledger.id}
@@ -1574,6 +1895,8 @@ function Ledger({ onSignOut }) {
               onGuideUsed={() => setChatGuide(null)}
               nudge={chatNudge}
               onNudgeUsed={() => setChatNudge(null)}
+              brief={chatBrief}
+              onBriefUsed={() => setChatBrief(null)}
               apply={{ addTx, addAR, settleAR, setPlanned, setAnchor }}
               onGo={(view) => {
                 setChatOpen(false);
@@ -1588,29 +1911,57 @@ function Ledger({ onSignOut }) {
         </div>
       </div>
 
-      {/* ===== floating dock: all sections, capture lives on the right ===== */}
-      <nav className="fixed z-40 left-1/2 bottom-4" style={{ transform: "translateX(-50%)", maxWidth: "calc(100vw - 20px)" }}>
+      {/* On desktop the dock is gone, so Tally gets a corner of her own. Same
+          state, same panel, just a trigger that survives the rail. */}
+      <button
+        onClick={() => { setChatOpen(!chatOpen); if (!chatOpen) setChatUnread(false); }}
+        aria-label={chatUnread ? "Tally has something to tell you" : "Talk to Tally"}
+        title={chatOpen ? "Close Tally" : "Talk to Tally"}
+        className="hidden lg:flex fixed z-40 items-center justify-center"
+        style={{
+          right: 24, bottom: 24, width: 60, height: 60, borderRadius: 22,
+          background: P.brass, color: P.onbrass, boxShadow: elev(3),
+          transition: "transform .18s cubic-bezier(.2,.8,.2,1), opacity .25s ease",
+          opacity: chatOpen ? 0 : 1, transform: chatOpen ? "scale(.7)" : "none",
+          pointerEvents: chatOpen ? "none" : "auto",
+        }}
+      >
+        <MessageCircle size={24} />
+        {chatUnread && !chatOpen && (
+          <span
+            aria-hidden
+            style={{
+              position: "absolute", top: 4, right: 4, width: 12, height: 12, borderRadius: "50%",
+              background: P.debit, border: `2px solid ${P.brass}`,
+            }}
+          />
+        )}
+      </button>
+
+      {/* ===== floating dock: all sections, Tally lives on the right ===== */}
+      <nav className="fixed z-40 left-1/2 bottom-4 lg:hidden" style={{ transform: "translateX(-50%)", maxWidth: "calc(100vw - 20px)" }}>
         <div
           className="dock flex items-center gap-0.5 px-2 py-1.5 rounded-full"
-          style={{ background: theme === "dark" ? "rgba(23,31,27,0.72)" : "rgba(251,250,245,0.78)", border: `1px solid ${P.line}`, backdropFilter: "blur(18px) saturate(1.4)", WebkitBackdropFilter: "blur(18px) saturate(1.4)", boxShadow: "0 10px 34px rgba(0,0,0,0.30)" }}
+          style={{ background: theme === "dark" ? "rgba(23,31,27,0.72)" : "rgba(251,250,245,0.78)", border: `1px solid ${P.line}`, backdropFilter: "blur(18px) saturate(1.4)", WebkitBackdropFilter: "blur(18px) saturate(1.4)", boxShadow: elev(3) }}
         >
           {tabs.map(([k, label, Icon]) => (
-            <DockBtn key={k} label={label} active={tab === k} onClick={() => { setTab(k); setChatOpen(false); }}><Icon size={19} /></DockBtn>
+            <DockBtn key={k} label={label} active={tab === k} onClick={() => { setTab(k); setChatOpen(false); }}><Icon size={18} /></DockBtn>
           ))}
 
           {/* divider */}
           <span aria-hidden style={{ width: 1, height: 24, background: P.line, margin: "0 4px", flexShrink: 0 }} />
 
-          {/* capture button, frosted brass, on the right */}
+          {/* Tally, frosted brass, on the right. A speech bubble says "someone is
+              in here"; a plus said "this adds a row". */}
           <button
             onClick={() => { setChatOpen(!chatOpen); if (!chatOpen) setChatUnread(false); }}
-            title={chatOpen ? "Close Brasstally" : chatUnread ? "Brasstally has something to tell you" : "Message Brasstally, capture a receipt or ask about the ledger"}
-            aria-label="Brasstally"
+            title={chatOpen ? "Close Tally" : chatUnread ? "Tally has something to tell you" : "Talk to Tally, capture a receipt or ask about the books"}
+            aria-label={chatUnread ? "Tally has something to tell you" : "Talk to Tally"}
             className="dock-capture rounded-full flex items-center justify-center shrink-0"
-            style={{ position: "relative", background: theme === "dark" ? "rgba(242,185,74,0.22)" : "rgba(184,134,11,0.16)", color: P.brass, border: `1px solid ${theme === "dark" ? "rgba(242,185,74,0.5)" : "rgba(184,134,11,0.4)"}`, width: 44, height: 44, backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }}
+            style={{ position: "relative", background: theme === "dark" ? "rgba(242,185,74,0.22)" : "rgba(223,167,38,0.16)", color: P.brassText, border: `1px solid ${theme === "dark" ? "rgba(242,185,74,0.5)" : "rgba(223,167,38,0.4)"}`, width: 44, height: 44, backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)" }}
           >
-            <span className="dock-capture-icon" style={{ display: "inline-flex", transform: chatOpen ? "rotate(45deg)" : "none", transition: "transform .28s cubic-bezier(.2,.8,.2,1)" }}>
-              <Plus size={22} />
+            <span className="dock-capture-icon" style={{ display: "inline-flex", transform: chatOpen ? "scale(.88)" : "none", transition: "transform .28s cubic-bezier(.2,.8,.2,1)" }}>
+              {chatOpen ? <X size={20} /> : <MessageCircle size={21} />}
             </span>
             {chatUnread && !chatOpen && (
               <span
@@ -1627,6 +1978,7 @@ function Ledger({ onSignOut }) {
       </nav>
 
       <ToastContainer notifications={notifications} onDismiss={dismissNotification} palette={P} />
+      <ConfirmHost />
 
       <PreviewModal preview={preview} onClose={closePreview} />
       {accountOpen && <AccountModal theme={theme} setTheme={setTheme} onSignOut={onSignOut} onResetLedger={resetAll} ledgerName={data.ledger.name} onClose={() => setAccountOpen(false)} />}
@@ -1698,14 +2050,16 @@ function PreviewModal({ preview, onClose }) {
   const isImage = preview.type?.startsWith("image/");
   const isPdf = preview.type === "application/pdf";
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
       <div
-        style={{ background: P.surface, border: `1px solid ${P.line}` }}
-        className="rounded-lg w-full max-w-3xl max-h-full flex flex-col overflow-hidden"
+        role="dialog"
+        aria-modal="true"
+        style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }}
+        className="modal-panel w-full max-w-3xl max-h-full flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2 px-4 py-2" style={{ borderBottom: `1px solid ${P.line}` }}>
-          <FileText size={14} style={{ color: P.brass }} />
+          <FileText size={14} style={{ color: P.brassText }} />
           <div className="text-sm truncate flex-1" style={{ color: P.text }}>{preview.name || "Filed document"}</div>
           {!preview.error && (
             <button
@@ -1759,8 +2113,8 @@ function ReconcileModal({ currentValue, initialAmount, anchorAmount, anchorDate,
   const drift = valid && currentValue != null ? parsed - currentValue : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+      <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between gap-3 mb-1">
           <h3 style={{ fontFamily: SERIF }} className="text-lg">Correct the balance</h3>
           <button onClick={onClose} style={{ color: P.muted }} className="p-1"><X size={16} /></button>
@@ -1806,7 +2160,7 @@ function ReconcileModal({ currentValue, initialAmount, anchorAmount, anchorDate,
         <Btn className="w-full justify-center" disabled={!valid} onClick={() => onSave(parsed, date)}>
           <Check size={14} /> Anchor balance here
         </Btn>
-        <button onClick={onImportInstead} style={{ color: P.brass, fontFamily: MONO }} className="w-full text-center text-xs mt-3 underline decoration-dotted underline-offset-2">
+        <button onClick={onImportInstead} style={{ color: P.brassText, fontFamily: MONO }} className="w-full text-center text-xs mt-3 underline decoration-dotted underline-offset-2">
           or import a bank statement to reconcile line by line →
         </button>
       </div>
@@ -1881,7 +2235,7 @@ const BookLine = ({ t, selected, onSelect }) => (
 function PlanLine({ children, tone = "muted" }) {
   return (
     <div className="flex items-start gap-2 text-sm" style={{ color: P[tone] }}>
-      <span style={{ color: P.brass }} className="shrink-0">·</span>
+      <span style={{ color: P.brassText }} className="shrink-0">·</span>
       <span>{children}</span>
     </div>
   );
@@ -1922,6 +2276,8 @@ function MatchView({
   const [openDup, setOpenDup] = useState(null); // duplicate group expanded to its copies
   const [fixing, setFixing] = useState(false);
   const [fixedSummary, setFixedSummary] = useState(null); // what the approved plan actually did
+  const [skipped, setSkipped] = useState([]);   // keys pushed to the back, in skip order
+  const [showAllAsks, setShowAllAsks] = useState(false);   // the old wall, on request
   // Everything this session did, in order. It becomes the history record on the
   // way out, so a consolidation can be read back line by line months later.
   const [log, setLog] = useState([]);
@@ -1941,6 +2297,50 @@ function MatchView({
   const ignored = bankTxns.filter((b) => b.status === "ignored");
   const txById = useMemo(() => new Map(data.transactions.map((t) => [t.id, t])), [data.transactions]);
 
+  /* ---- the questions, as a queue rather than a wall ----
+     Answering one changes the books, which recomputes the plan, which drops the
+     answered item out of this list. So "what to ask next" is always the head of
+     what is still open — there is no cursor to keep in sync, and nothing can be
+     asked twice. Skipped items go to the back instead of disappearing, so
+     finishing the easy ones never loses the hard ones. */
+  const asks = useMemo(() => [
+    ...plan.ask.changed.map((b) => ({ key: `changed:${b.id}`, kind: "changed", item: b })),
+    ...plan.ask.maybeDuplicates.map((g) => ({ key: `dup:${g.id}`, kind: "dup", item: g })),
+    ...plan.ask.pairs.map((p) => ({ key: `pair:${p.bankId}`, kind: "pair", item: p })),
+    ...plan.ask.unrecorded.map((b) => ({ key: `new:${b.id}`, kind: "new", item: b })),
+  ], [plan]);
+
+  // Every question this session has ever put up, so progress counts against the
+  // pile someone actually walked in with and doesn't shrink as they answer.
+  const seen = useRef(new Set());
+  for (const a of asks) seen.current.add(a.key);
+  const totalAsked = seen.current.size;
+  const answered = Math.max(0, totalAsked - asks.length);
+
+  // Skipped keys are held in the order they were skipped, not as a set: once
+  // everything else is answered the only way to move off a card is to send it
+  // to the back, and a set has no back.
+  const byKey = useMemo(() => new Map(asks.map((a) => [a.key, a])), [asks]);
+  const pending = asks.filter((a) => !skipped.includes(a.key));
+  const deferred = skipped.map((k) => byKey.get(k)).filter(Boolean);
+  // Skipped items come back once everything else is done, rather than being a
+  // way to never deal with them.
+  const current = pending[0] || deferred[0] || null;
+  const onLastLap = !pending.length && deferred.length > 0;
+
+  // Sending the current card to the back covers both laps: on the first it
+  // leaves `pending`, on the last it moves behind the other skipped ones.
+  const skipCurrent = () => {
+    if (!current) return;
+    setSkipped((s) => [...s.filter((k) => k !== current.key), current.key]);
+  };
+
+  // Stale keys pile up as the books change underneath the queue; drop the ones
+  // that no longer name a live question so `deferred` can actually empty out.
+  useEffect(() => {
+    setSkipped((s) => (s.every((k) => byKey.has(k)) ? s : s.filter((k) => byKey.has(k))));
+  }, [byKey]);
+
   /* ---- every action goes through here, so nothing happens off the record ---- */
   const note = (entry) => setLog((l) => [...l, { at: new Date().toISOString(), ...entry }]);
 
@@ -1949,7 +2349,7 @@ function MatchView({
     const t = txById.get(txId);
     actions.match(bankId, txId, source);
     note({
-      kind: "matched", date: b?.date, amount: b?.amount,
+      kind: "matched", bankId, date: b?.date, amount: b?.amount,
       description: b?.description || "bank line",
       detail: `paired with ${t?.description || t?.category || "an entry"}${t?.date && t.date !== b?.date ? ` dated ${t.date}` : ""}`,
     });
@@ -1964,7 +2364,32 @@ function MatchView({
   const doIgnore = (bankId) => {
     const b = bankTxns.find((x) => x.id === bankId);
     actions.ignore(bankId);
-    note({ kind: "ignored", date: b?.date, amount: b?.amount, description: b?.description || "bank line", detail: "set aside, it will never have an entry" });
+    note({ kind: "ignored", bankId, date: b?.date, amount: b?.amount, description: b?.description || "bank line", detail: "set aside, it will never have an entry" });
+  };
+
+  /* ---- taking the last answer back ----
+     Only pairing and setting aside are genuinely reversible. Removing a
+     duplicate deletes rows and adding an entry creates one, so neither is
+     offered here: the button disappears rather than promising an undo it
+     cannot honour. Undoing also drops the entry from the log, so the run
+     that gets filed is what was actually decided, not a decision and its
+     retraction. */
+  const undoable = (() => {
+    const last = log[log.length - 1];
+    if (!last || !last.bankId) return null;
+    if (last.kind === "matched") return { last, verb: "pairing" };
+    if (last.kind === "ignored") return { last, verb: "set-aside" };
+    return null;
+  })();
+
+  const undoLast = () => {
+    if (!undoable) return;
+    const { last } = undoable;
+    if (last.kind === "matched") actions.unmatch(last.bankId);
+    else actions.unignore(last.bankId);
+    setLog((l) => l.slice(0, -1));
+    // It came back as a question; don't let a stale skip bury it at the back.
+    setSkipped((s) => s.filter((k) => k !== `pair:${last.bankId}` && k !== `new:${last.bankId}`));
   };
 
   const doCreate = (b, opts) => {
@@ -2070,9 +2495,92 @@ function MatchView({
           ? `I went through ${plan.scanned.bank} bank ${plan.scanned.bank === 1 ? "line" : "lines"} and found ${plan.fix.count} ${plan.fix.count === 1 ? "thing" : "things"} I can sort out myself. Nothing else needs you.`
           : `Nothing for me to fix automatically. ${plan.ask.count} ${plan.ask.count === 1 ? "thing needs" : "things need"} a decision from you.`;
 
+  /* ---- one question, drawn the same whether it arrives alone or in a list ----
+     The stepper and the show-everything view render from this, so the wording
+     and the buttons can never drift apart between the two. */
+  const renderAsk = (a) => {
+    const { kind, item } = a;
+
+    if (kind === "changed") return (
+      <AskCard key={a.key} tone="debit" amount={item.amount} date={item.date}
+        title={`The bank changed this after you had already dealt with it: ${item.description}`}
+        detail={item.reviewReason}>
+        {item.matchedTxId && <Btn tone="ghost" onClick={() => doUnmatch(item.id)}>Undo the pairing</Btn>}
+        <Btn tone="ghost" onClick={() => actions.dismissFlag(item.id)}>It is fine, leave it</Btn>
+      </AskCard>
+    );
+
+    if (kind === "dup") return (
+      <AskCard key={a.key} tone="brass" amount={item.amount} date={item.date}
+        title={`Did you pay ${item.description || item.keep.category} once or ${item.extras.length + 1} times?`}
+        detail={`${item.extras.length + 1} entries, ${item.reason}. A copy counts twice in the profit and loss, the budget, and the difference against the bank.`}>
+        <Btn onClick={() => doRemoveDup(item)}><Trash2 size={13} /> Once, remove the {item.extras.length === 1 ? "other" : `other ${item.extras.length}`}</Btn>
+        <button onClick={() => setOpenDup(openDup === item.id ? null : item.id)} style={{ color: P.brassText, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+          {openDup === item.id ? "hide" : "show me"} the copies
+        </button>
+        {openDup === item.id && (
+          <div className="w-full mt-1 space-y-1">
+            {[item.keep, ...item.extras].map((t, i) => (
+              <div key={t.id} className="flex items-center gap-2 text-xs" style={{ fontFamily: MONO, color: i === 0 ? P.text : P.faint }}>
+                <span className="shrink-0" style={{ color: i === 0 ? P.credit : P.debit }}>{i === 0 ? "keep" : "drop"}</span>
+                <span className="flex-1 truncate">
+                  {t.date}{fmtEntryTime(t.createdAt) ? ` ${fmtEntryTime(t.createdAt)}` : ""} · {t.description || t.category}{t.subcategory ? ` / ${t.subcategory}` : ""}
+                </span>
+                {t.attachmentId && <Paperclip size={11} className="shrink-0" />}
+                <span className="tabular-nums shrink-0">{fmt(t.amount)}</span>
+              </div>
+            ))}
+            <div style={{ color: P.faint }} className="text-xs">Keeping the wrong one? Delete the other from Transactions instead.</div>
+          </div>
+        )}
+      </AskCard>
+    );
+
+    if (kind === "pair") return (
+      <AskCard key={a.key} amount={item.bank.amount} date={item.bank.date}
+        title={`Is "${item.bank.description}" the same thing as "${item.tx.description || item.tx.category}"?`}
+        detail={item.ambiguous
+          ? "Another entry fits this line just as well, so I will not guess. Check which one it is."
+          : `${item.gap === 0 ? "Same day" : `${item.gap} ${item.gap === 1 ? "day" : "days"} apart`}, and the descriptions ${item.text >= 0.5 ? "roughly agree" : "do not agree"}.`}>
+        <Btn onClick={() => doMatch(item.bankId, item.txId, "manual")}><Check size={13} /> Yes, same thing</Btn>
+        <Btn tone="ghost" onClick={() => setAdding(adding?.id === item.bank.id ? null : item.bank)}>No, it is new</Btn>
+        <Btn tone="ghost" onClick={() => doIgnore(item.bankId)}>Not mine, set it aside</Btn>
+        {adding?.id === item.bank.id && (
+          <div className="w-full">
+            <AddFromBank
+              bankTxn={item.bank} data={data} bankTxns={bankTxns}
+              onMatchInstead={(txId) => { doMatch(item.bank.id, txId, "manual"); setAdding(null); }}
+              onCancel={() => setAdding(null)}
+              onAdd={(opts) => { doCreate(item.bank, opts); setAdding(null); }}
+            />
+          </div>
+        )}
+      </AskCard>
+    );
+
+    return (
+      <AskCard key={a.key} amount={item.amount} date={item.date}
+        title={`${item.direction === "credit" ? "Money came in" : "Money went out"} and the books have nothing for it: ${item.description}`}
+        detail={item.pending ? "Still pending at the bank, so it may change." : "Add it to the books, or set it aside if it belongs to another ledger."}>
+        <Btn onClick={() => setAdding(adding?.id === item.id ? null : item)}><Plus size={13} /> Add it to the books</Btn>
+        <Btn tone="ghost" onClick={() => doIgnore(item.id)}>Set it aside</Btn>
+        {adding?.id === item.id && (
+          <div className="w-full">
+            <AddFromBank
+              bankTxn={item} data={data} bankTxns={bankTxns}
+              onMatchInstead={(txId) => { doMatch(item.id, txId, "manual"); setAdding(null); }}
+              onCancel={() => setAdding(null)}
+              onAdd={(opts) => { doCreate(item, opts); setAdding(null); }}
+            />
+          </div>
+        )}
+      </AskCard>
+    );
+  };
+
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center p-3 overflow-y-auto" style={{ background: P.overlay }} onClick={closeView}>
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-3xl p-5 my-6" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-start justify-center p-3 overflow-y-auto" style={{ background: P.overlay }} onClick={closeView}>
+      <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-3xl p-5 my-6" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between gap-3 mb-3">
           <div>
             <h3 style={{ fontFamily: SERIF }} className="text-xl">Consolidate</h3>
@@ -2101,17 +2609,17 @@ function MatchView({
         {/* ---- the plan, written out before it runs ---- */}
         {plan.fix.count > 0 && !fixedSummary && (
           <div style={{ background: P.bg, border: `1px solid ${P.brass}` }} className="rounded-lg p-4 mb-4">
-            <div style={{ color: P.brass, fontFamily: MONO }} className="text-xs uppercase tracking-wider mb-2">
+            <div style={{ color: P.brassText, fontFamily: MONO }} className="text-xs uppercase tracking-wider mb-2">
               What I would do
             </div>
             <div className="space-y-1.5">
               {plan.fix.lines.map((l, i) => <PlanLine key={i}>{l}</PlanLine>)}
             </div>
             <div className="flex flex-wrap items-center gap-2 mt-3">
-              <Btn onClick={runPlan} disabled={fixing}>
-                {fixing ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />} Go ahead
+              <Btn onClick={runPlan} loading={fixing}>
+                {!fixing && <Check size={13} />} Go ahead
               </Btn>
-              <button onClick={() => setShowManual(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">
+              <button onClick={() => setShowManual(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
                 let me look at each one first
               </button>
             </div>
@@ -2137,100 +2645,85 @@ function MatchView({
           </div>
         )}
 
-        {/* ---- the questions ---- */}
-        {plan.ask.count > 0 && (
+        {/* ---- the questions, one at a time ----
+             The pile is the thing that makes people close this screen, so only
+             the question at the head of the queue is on screen. Everything
+             behind it is a count, not a wall. The full list is still one tap
+             away for anyone who would rather triage than answer. */}
+        {asks.length > 0 && (
           <div className="mb-4">
             <div className="flex items-baseline justify-between gap-2 mb-2">
               <Label>Over to you</Label>
-              <span style={{ fontFamily: MONO, color: P.faint }} className="text-xs">{plan.ask.count} left</span>
+              <span style={{ fontFamily: MONO, color: P.faint }} className="text-xs tabular-nums">
+                {showAllAsks
+                  ? `${asks.length} left`
+                  : `question ${Math.min(answered + 1, totalAsked)} of ${totalAsked}`}
+              </span>
             </div>
-            <div className="space-y-2">
 
-              {/* the bank changed something already settled */}
-              {plan.ask.changed.map((b) => (
-                <AskCard key={b.id} tone="debit" amount={b.amount} date={b.date}
-                  title={`The bank changed this after you had already dealt with it: ${b.description}`}
-                  detail={b.reviewReason}>
-                  {b.matchedTxId && <Btn tone="ghost" onClick={() => doUnmatch(b.id)}>Undo the pairing</Btn>}
-                  <Btn tone="ghost" onClick={() => actions.dismissFlag(b.id)}>It is fine, leave it</Btn>
-                </AskCard>
-              ))}
+            {/* how far along, without a number to decode */}
+            {!showAllAsks && totalAsked > 1 && (
+              <div className="flex gap-1 mb-3" aria-hidden="true">
+                {Array.from({ length: Math.min(totalAsked, 24) }, (_, i) => (
+                  <div key={i} className="h-1 flex-1 rounded-full"
+                    style={{ background: i < answered ? P.brass : P.line }} />
+                ))}
+              </div>
+            )}
 
-              {/* recorded twice, but not identically */}
-              {plan.ask.maybeDuplicates.map((g) => (
-                <AskCard key={g.id} tone="brass" amount={g.amount} date={g.date}
-                  title={`Did you pay ${g.description || g.keep.category} once or ${g.extras.length + 1} times?`}
-                  detail={`${g.extras.length + 1} entries, ${g.reason}. A copy counts twice in the profit and loss, the budget, and the difference against the bank.`}>
-                  <Btn onClick={() => doRemoveDup(g)}><Trash2 size={13} /> Once, remove the {g.extras.length === 1 ? "other" : `other ${g.extras.length}`}</Btn>
-                  <button onClick={() => setOpenDup(openDup === g.id ? null : g.id)} style={{ color: P.brass, fontFamily: MONO }} className="text-xs underline decoration-dotted">
-                    {openDup === g.id ? "hide" : "show me"} the copies
+            {showAllAsks ? (
+              <div className="space-y-2">
+                {asks.slice(0, 50).map(renderAsk)}
+                {asks.length > 50 && (
+                  <div style={{ color: P.faint }} className="text-xs">
+                    and {asks.length - 50} more. Deal with these first and the rest will still be here.
+                  </div>
+                )}
+              </div>
+            ) : current ? (
+              <>
+                {onLastLap && (
+                  <p style={{ color: P.faint }} className="text-xs mb-2">
+                    That is everything else dealt with. These are the {deferred.length} you passed on.
+                  </p>
+                )}
+                {renderAsk(current)}
+                <div className="flex items-center gap-3 mt-2 flex-wrap">
+                  {undoable && (
+                    <button onClick={undoLast} style={{ color: P.brassText, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+                      <ChevronLeft size={11} className="inline mb-0.5" /> undo the last {undoable.verb}
+                    </button>
+                  )}
+                  {asks.length > 1 && (
+                    <button onClick={skipCurrent} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+                      {onLastLap ? "still not sure, next one" : "skip for now"}
+                    </button>
+                  )}
+                  <button onClick={() => setShowAllAsks(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 ml-auto">
+                    show all {asks.length} at once
                   </button>
-                  {openDup === g.id && (
-                    <div className="w-full mt-1 space-y-1">
-                      {[g.keep, ...g.extras].map((t, i) => (
-                        <div key={t.id} className="flex items-center gap-2 text-xs" style={{ fontFamily: MONO, color: i === 0 ? P.text : P.faint }}>
-                          <span className="shrink-0" style={{ color: i === 0 ? P.credit : P.debit }}>{i === 0 ? "keep" : "drop"}</span>
-                          <span className="flex-1 truncate">
-                            {t.date}{fmtEntryTime(t.createdAt) ? ` ${fmtEntryTime(t.createdAt)}` : ""} · {t.description || t.category}{t.subcategory ? ` / ${t.subcategory}` : ""}
-                          </span>
-                          {t.attachmentId && <Paperclip size={11} className="shrink-0" />}
-                          <span className="tabular-nums shrink-0">{fmt(t.amount)}</span>
-                        </div>
-                      ))}
-                      <div style={{ color: P.faint }} className="text-xs">Keeping the wrong one? Delete the other from Transactions instead.</div>
-                    </div>
-                  )}
-                </AskCard>
-              ))}
-
-              {/* two entries fit the same bank line, or the text does not agree */}
-              {plan.ask.pairs.slice(0, 12).map((p) => (
-                <AskCard key={p.bankId} amount={p.bank.amount} date={p.bank.date}
-                  title={`Is "${p.bank.description}" the same thing as "${p.tx.description || p.tx.category}"?`}
-                  detail={p.ambiguous
-                    ? "Another entry fits this line just as well, so I will not guess. Check which one it is."
-                    : `${p.gap === 0 ? "Same day" : `${p.gap} ${p.gap === 1 ? "day" : "days"} apart`}, and the descriptions ${p.text >= 0.5 ? "roughly agree" : "do not agree"}.`}>
-                  <Btn onClick={() => doMatch(p.bankId, p.txId, "manual")}><Check size={13} /> Yes, same thing</Btn>
-                  <Btn tone="ghost" onClick={() => setAdding(adding?.id === p.bank.id ? null : p.bank)}>No, it is new</Btn>
-                  <Btn tone="ghost" onClick={() => doIgnore(p.bankId)}>Not mine, set it aside</Btn>
-                  {adding?.id === p.bank.id && (
-                    <div className="w-full">
-                      <AddFromBank
-                        bankTxn={p.bank} data={data} bankTxns={bankTxns}
-                        onMatchInstead={(txId) => { doMatch(p.bank.id, txId, "manual"); setAdding(null); }}
-                        onCancel={() => setAdding(null)}
-                        onAdd={(opts) => { doCreate(p.bank, opts); setAdding(null); }}
-                      />
-                    </div>
-                  )}
-                </AskCard>
-              ))}
-
-              {/* the bank saw money move and the books never heard about it */}
-              {plan.ask.unrecorded.slice(0, 20).map((b) => (
-                <AskCard key={b.id} amount={b.amount} date={b.date}
-                  title={`${b.direction === "credit" ? "Money came in" : "Money went out"} and the books have nothing for it: ${b.description}`}
-                  detail={b.pending ? "Still pending at the bank, so it may change." : "Add it to the books, or set it aside if it belongs to another ledger."}>
-                  <Btn onClick={() => setAdding(adding?.id === b.id ? null : b)}><Plus size={13} /> Add it to the books</Btn>
-                  <Btn tone="ghost" onClick={() => doIgnore(b.id)}>Set it aside</Btn>
-                  {adding?.id === b.id && (
-                    <div className="w-full">
-                      <AddFromBank
-                        bankTxn={b} data={data} bankTxns={bankTxns}
-                        onMatchInstead={(txId) => { doMatch(b.id, txId, "manual"); setAdding(null); }}
-                        onCancel={() => setAdding(null)}
-                        onAdd={(opts) => { doCreate(b, opts); setAdding(null); }}
-                      />
-                    </div>
-                  )}
-                </AskCard>
-              ))}
-
-              {plan.ask.unrecorded.length > 20 && (
-                <div style={{ color: P.faint }} className="text-xs">
-                  and {plan.ask.unrecorded.length - 20} more bank lines. Deal with these first and the rest will still be here.
                 </div>
-              )}
+              </>
+            ) : null}
+
+            {showAllAsks && (
+              <button onClick={() => setShowAllAsks(false)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 mt-3">
+                back to one at a time
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* ---- the queue just emptied ----
+             Only worth saying if there was a queue to empty: someone who opened
+             a clean ledger already read that in the headline. */}
+        {asks.length === 0 && answered > 0 && (
+          <div style={{ background: P.bg, border: `1px solid ${P.credit}` }} className="rounded-lg p-3 mb-4">
+            <div style={{ color: P.credit }} className="text-sm">
+              <Check size={13} className="inline mb-0.5" /> That is all of them. You answered {answered} {answered === 1 ? "question" : "questions"}.
+            </div>
+            <div style={{ color: P.faint }} className="text-xs mt-1">
+              Nothing else is waiting on you. Save below and the app stops asking until the bank or the books move.
             </div>
           </div>
         )}
@@ -2244,7 +2737,7 @@ function MatchView({
         )}
 
         {/* ---- the old two-column screen, for when you do want to drive ---- */}
-        <button onClick={() => setShowManual(!showManual)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">
+        <button onClick={() => setShowManual(!showManual)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
           {showManual ? "hide" : "show"} everything line by line
         </button>
 
@@ -2255,7 +2748,7 @@ function MatchView({
                 <Label>On the bank, not in the books ({plan.ask.unrecorded.length})</Label>
                 <div className="space-y-2">
                   {plan.ask.unrecorded.length === 0 && (
-                    <p style={{ color: P.faint }} className="text-sm py-3">Every bank line is accounted for.</p>
+                    <EmptyState compact icon={Check} title="Every bank line is accounted for" />
                   )}
                   {plan.ask.unrecorded.map((b) => (
                     <div key={b.id}>
@@ -2269,7 +2762,7 @@ function MatchView({
                 <Label>In the books, not on the bank ({plan.uncleared.length})</Label>
                 <div className="space-y-2">
                   {plan.uncleared.length === 0 && (
-                    <p style={{ color: P.faint }} className="text-sm py-3">Every entry has cleared.</p>
+                    <EmptyState compact icon={Check} title="Every entry has cleared" />
                   )}
                   {plan.uncleared.slice(0, 60).map((t) => (
                     <BookLine key={t.id} t={t} selected={pickedTx === t.id} onSelect={() => setPickedTx(pickedTx === t.id ? null : t.id)} />
@@ -2290,7 +2783,7 @@ function MatchView({
 
             {(matched.length > 0 || ignored.length > 0) && (
               <div className="mb-4">
-                <button onClick={() => setShowMatched(!showMatched)} style={{ color: P.brass, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+                <button onClick={() => setShowMatched(!showMatched)} style={{ color: P.brassText, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 underline-offset-2">
                   {showMatched ? "hide" : "show"} {matched.length} already paired, {ignored.length} set aside
                 </button>
                 {showMatched && (
@@ -2300,7 +2793,7 @@ function MatchView({
                         <Check size={11} style={{ color: P.credit }} className="shrink-0" />
                         <span className="flex-1 truncate">{b.date} {b.description} → {txById.get(b.matchedTxId)?.description || "entry"}</span>
                         <span className="tabular-nums shrink-0">{fmt(b.amount)}</span>
-                        <button onClick={() => doUnmatch(b.id)} style={{ color: P.brass }}>undo</button>
+                        <button onClick={() => doUnmatch(b.id)} style={{ color: P.brassText }}>undo</button>
                       </div>
                     ))}
                     {ignored.map((b) => (
@@ -2308,7 +2801,7 @@ function MatchView({
                         <X size={11} className="shrink-0" />
                         <span className="flex-1 truncate">{b.date} {b.description}</span>
                         <span className="tabular-nums shrink-0">{fmt(b.amount)}</span>
-                        <button onClick={() => actions.unignore(b.id)} style={{ color: P.brass }}>bring it back</button>
+                        <button onClick={() => actions.unignore(b.id)} style={{ color: P.brassText }}>bring it back</button>
                       </div>
                     ))}
                   </div>
@@ -2316,7 +2809,7 @@ function MatchView({
               </div>
             )}
 
-            <button onClick={onAnchorInstead} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+            <button onClick={onAnchorInstead} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 underline-offset-2">
               or force the books to the bank balance, which sets the difference to zero without explaining it
             </button>
           </div>
@@ -2325,7 +2818,7 @@ function MatchView({
         {/* ---- what past consolidations did, in sentences ---- */}
         {consolidation?.history?.length > 0 && (
           <div className="mt-4">
-            <button onClick={() => setShowHistory(!showHistory)} style={{ color: P.brass, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
+            <button onClick={() => setShowHistory(!showHistory)} style={{ color: P.brassText, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 underline-offset-2">
               <History size={11} className="inline mb-0.5" /> {showHistory ? "hide" : "show"} what past consolidations did
             </button>
             {showHistory && (
@@ -2471,10 +2964,10 @@ function AddFromBank({ bankTxn, data, bankTxns = [], onAdd, onMatchInstead, onCa
   );
 
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded p-2 mb-2">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-2 mb-2">
       {already && (
         <div style={{ border: `1px solid ${P.brass}` }} className="rounded p-2 mb-2">
-          <div style={{ color: P.brass, fontFamily: MONO }} className="text-xs uppercase tracking-wider mb-1">
+          <div style={{ color: P.brassText, fontFamily: MONO }} className="text-xs uppercase tracking-wider mb-1">
             <AlertTriangle size={11} className="inline mb-0.5" /> possibly already recorded
           </div>
           <div className="text-xs" style={{ color: P.muted }}>
@@ -2644,10 +3137,12 @@ function ImportModal({ data, addSub, onImport, onClose }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
       <div
-        style={{ background: P.surface, border: `1px solid ${P.line}` }}
-        className="rounded-lg w-full max-w-2xl max-h-full flex flex-col overflow-hidden"
+        role="dialog"
+        aria-modal="true"
+        style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }}
+        className="modal-panel w-full max-w-2xl max-h-full flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between gap-3 px-5 py-3" style={{ borderBottom: `1px solid ${P.line}` }}>
@@ -2671,8 +3166,8 @@ function ImportModal({ data, addSub, onImport, onClose }) {
               className="w-full rounded p-3 text-xs outline-none"
             />
             <div className="flex items-center gap-3">
-              <Btn onClick={handlePaste} disabled={busy || !pasted.trim()}>
-                {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />} Read pasted text
+              <Btn onClick={handlePaste} loading={busy} disabled={!pasted.trim()}>
+                {!busy && <Check size={14} />} Read pasted text
               </Btn>
               <span style={{ color: P.faint, fontFamily: MONO }} className="text-xs">or</span>
               <input ref={fileRef} type="file" accept=".pdf,.csv,.txt,.tsv,image/*,application/pdf,text/csv" className="hidden"
@@ -2682,9 +3177,7 @@ function ImportModal({ data, addSub, onImport, onClose }) {
               </Btn>
             </div>
             {busy && (
-              <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs flex items-center gap-2">
-                <Loader2 size={12} className="animate-spin" /> reading every line… longer statements take a moment
-              </div>
+              <LoadingLine>reading every line… longer statements take a moment</LoadingLine>
             )}
             {err && <p style={{ color: P.debit }} className="text-xs">{err}</p>}
           </div>
@@ -2695,7 +3188,7 @@ function ImportModal({ data, addSub, onImport, onClose }) {
             <div className="px-5 py-3 space-y-2" style={{ borderBottom: `1px solid ${P.line}` }}>
               <p style={{ color: P.muted }} className="text-sm">
                 Found <span style={{ color: P.text }}>{rows.length}</span> lines
-                {dupCount > 0 && <> · <span style={{ color: P.brass }}>{dupCount} look like they're already in the ledger</span> (unchecked, tick any that aren't actually duplicates)</>}.
+                {dupCount > 0 && <> · <span style={{ color: P.brassText }}>{dupCount} look like they're already in the ledger</span> (unchecked, tick any that aren't actually duplicates)</>}.
               </p>
               {err && <p style={{ color: P.faint }} className="text-xs">{err}</p>}
               {ending && (
@@ -2703,7 +3196,7 @@ function ImportModal({ data, addSub, onImport, onClose }) {
                   <input type="checkbox" checked={anchorToo} onChange={(e) => setAnchorToo(e.target.checked)} className="mt-0.5" />
                   <span>
                     Also anchor the balance to the statement's ending balance:{" "}
-                    <span style={{ fontFamily: MONO, color: P.brass }}>{fmt(ending.amount)}</span> on{" "}
+                    <span style={{ fontFamily: MONO, color: P.brassText }}>{fmt(ending.amount)}</span> on{" "}
                     <span style={{ fontFamily: MONO }}>{ending.date}</span>, after this, Balance to date matches the bank exactly.
                   </span>
                 </label>
@@ -2720,7 +3213,7 @@ function ImportModal({ data, addSub, onImport, onClose }) {
                       <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs w-12 shrink-0">{r.date?.slice(5)}</div>
                       <div className="flex-1 min-w-0">
                         <div className="text-sm truncate">{r.description}</div>
-                        {r.dup && <div style={{ color: P.brass, fontFamily: MONO }} className="text-xs">possible duplicate</div>}
+                        {r.dup && <div style={{ color: P.brassText, fontFamily: MONO }} className="text-xs">possible duplicate</div>}
                       </div>
                       <select
                         value={cats.includes(r.category) ? r.category : cats[0]}
@@ -2768,24 +3261,39 @@ function ImportModal({ data, addSub, onImport, onClose }) {
 }
 
 /* ================= signature: the ledger line ================= */
-function LedgerLine({ sums, balance, openBooks, creditsLeft, onCredits, onReconcile }) {
+function LedgerLine({ sums, balance, openBooks, creditsLeft, onCredits, onReconcile, needsConsolidation, consolidationSettled, onConsolidate }) {
   const max = Math.max(sums.inc, sums.exp, 1);
   const fromBank = balance.source === "bank";
   return (
-    <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
-      <div className="flex flex-wrap justify-between gap-4 mb-3">
-        <Stat label="Money in" value={fmt(sums.inc)} color={P.credit} />
-        <Stat label="Money out" value={fmt(sums.exp)} color={P.debit} />
-        <Stat label="Net this month" value={fmt(sums.net)} color={sums.net >= 0 ? P.credit : P.debit} />
-        <button onClick={onReconcile} className="text-left" title={fromBank ? "Bank balance · tap to align books" : "Set or correct the balance against your real accounts"}>
-          <Label>{fromBank ? "Balance to date · bank" : "Balance to date · fix"}</Label>
-          <div style={{ fontFamily: MONO, color: P.brass }} className="text-xl tabular-nums underline decoration-dotted underline-offset-4" >
-            {balance.beforeAnchor ? "·" : fmt(balance.value)}
-          </div>
-        </button>
+    <Card level={2}>
+      <div className="flex flex-wrap justify-between gap-5 mb-4">
+        <Stat size="text-xl" label="Money in" value={fmt(sums.inc)} tone={P.credit} />
+        <Stat size="text-xl" label="Money out" value={fmt(sums.exp)} tone={P.debit} />
+        <Stat size="text-xl" label="Net this month" value={fmt(sums.net)} tone={sums.net >= 0 ? P.credit : P.debit} />
+        <div className="flex items-start gap-1.5">
+          <button onClick={onReconcile} className="text-left" title={fromBank ? "Bank balance · tap to align books" : "Set or correct the balance against your real accounts"}>
+            <div style={{ color: P.faint, letterSpacing: "0.07em" }} className="text-xs uppercase mb-1">
+              {fromBank ? "Balance to date · bank" : "Balance to date · fix"}
+            </div>
+            <div style={{ fontFamily: MONO, color: P.brassText }} className="text-xl tabular-nums underline decoration-dotted underline-offset-4" >
+              {balance.beforeAnchor ? "·" : fmt(balance.value)}
+            </div>
+          </button>
+          {needsConsolidation && (
+            <button
+              type="button"
+              onClick={onConsolidate}
+              title={consolidationSettled ? "Consolidated, but the gap isn't fully explained yet. Tap to review." : "Bank and books disagree. Tap to consolidate."}
+              style={{ color: consolidationSettled ? P.muted : P.debit }}
+              className="mt-0.5 rounded p-0.5"
+            >
+              <AlertTriangle size={14} />
+            </button>
+          )}
+        </div>
         {creditsLeft !== null && (
           <button onClick={onCredits} className="text-left" title="Non-cash credits remaining across all pools, tap to manage">
-            <Label>Credits left</Label>
+            <div style={{ color: P.faint, letterSpacing: "0.07em" }} className="text-xs uppercase mb-1">Credits left</div>
             <div style={{ fontFamily: MONO, color: creditsLeft > 0 ? P.credit : P.debit }} className="text-xl tabular-nums underline decoration-dotted underline-offset-4">
               {fmt(creditsLeft)}
             </div>
@@ -2821,16 +3329,9 @@ function LedgerLine({ sums, balance, openBooks, creditsLeft, onCredits, onReconc
             ? `this month ends before your balance anchor (${balance.anchorDate}), no balance shown`
             : `anchored: ${fmt(balance.anchorAmount)} on ${balance.anchorDate} · tap the balance to correct it`}
       </div>
-    </div>
+    </Card>
   );
 }
-
-const Stat = ({ label, value, color }) => (
-  <div>
-    <Label>{label}</Label>
-    <div style={{ fontFamily: MONO, color }} className="text-xl tabular-nums">{value}</div>
-  </div>
-);
 
 /* ================= Overview ================= */
 function Overview({ data, monthTx, sums, setPlanned, month, insights = [], onAsk }) {
@@ -2847,7 +3348,7 @@ function Overview({ data, monthTx, sums, setPlanned, month, insights = [], onAsk
   return (
     <>
       <InsightsStrip insights={insights} onAsk={onAsk} />
-      <div className="grid md:grid-cols-2 gap-6">
+      <div className="grid md:grid-cols-2 gap-6 stagger">
         <BudgetTable title="Expenses" rows={expRows} extra={zeroExp} type="expense" monthTx={monthTx} setPlanned={setPlanned} onDrill={(cat) => setDrill({ type: "expense", category: cat })} />
         <BudgetTable title="Income" rows={incRows} extra={[]} type="income" monthTx={monthTx} setPlanned={setPlanned} onDrill={(cat) => setDrill({ type: "income", category: cat })} />
         {drill && <CategoryDrill drill={drill} monthTx={monthTx} month={month} onClose={() => setDrill(null)} />}
@@ -2878,43 +3379,52 @@ function InsightsStrip({ insights = [], onAsk }) {
   const shown = open ? live : live.slice(0, 2);
   const TONE = {
     alert: { color: P.debit, Icon: AlertTriangle },
-    warn: { color: P.brass, Icon: AlertTriangle },
+    warn: { color: P.brassText, Icon: AlertTriangle },
     info: { color: P.faint, Icon: Info },
   };
 
   return (
     <section className="mb-6">
-      <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs uppercase tracking-widest mb-2 flex items-center gap-1.5">
-        <Sparkles size={11} style={{ color: P.brass }} /> Worth a look
+      <div className="eyebrow mb-2.5 flex items-center gap-1.5">
+        <Sparkles size={11} /> Worth a look
       </div>
-      <div className="space-y-2">
-        {shown.map((i) => {
+      <div className="space-y-2.5">
+        {shown.map((i, n) => {
           const { color, Icon } = TONE[i.severity] || TONE.info;
           return (
-            <div
-              key={i.id}
-              style={{ background: P.surface, border: `1px solid ${i.severity === "alert" ? color + "66" : P.line}` }}
-              className="rounded-lg p-3 flex items-start gap-2.5"
-            >
-              <Icon size={14} style={{ color, flexShrink: 0, marginTop: 2 }} />
-              <div className="flex-1 min-w-0">
-                <div style={{ color: P.text }} className="text-sm">{i.title}</div>
-                <p style={{ color: P.muted }} className="text-xs mt-0.5">{i.detail}</p>
-                <div className="flex gap-1.5 mt-2">
-                  <Btn tone="ghost" onClick={() => onAsk?.(i.ask)}>
-                    <MessageSquare size={12} /> Look into it
-                  </Btn>
-                  <button
-                    type="button"
-                    onClick={() => drop(i.id)}
-                    style={{ color: P.faint, fontFamily: MONO }}
-                    className="text-xs px-2"
-                  >
-                    dismiss
-                  </button>
+            <Reveal key={i.id} delay={Math.min(n + 1, 3)}>
+              <div
+                style={{
+                  ...cardStyle(),
+                  border: `1px solid ${i.severity === "alert" ? color + "66" : P.line}`,
+                }}
+                className="p-4 flex items-start gap-3"
+              >
+                <div
+                  className="shrink-0 inline-flex items-center justify-center mt-0.5"
+                  style={{ width: 26, height: 26, borderRadius: 8, background: color + "1f", color }}
+                >
+                  <Icon size={13} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div style={{ color: P.text }} className="text-sm font-semibold">{i.title}</div>
+                  <p style={{ color: P.muted }} className="text-xs mt-1">{i.detail}</p>
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <Btn tone="ghost" size="sm" onClick={() => onAsk?.(i.ask)}>
+                      <MessageSquare size={12} /> Ask Tally
+                    </Btn>
+                    <button
+                      type="button"
+                      onClick={() => drop(i.id)}
+                      style={{ color: P.faint, fontFamily: MONO }}
+                      className="text-xs px-2 hover:opacity-70"
+                    >
+                      dismiss
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
+            </Reveal>
           );
         })}
       </div>
@@ -2952,10 +3462,12 @@ function CategoryDrill({ drill, monthTx, month, onClose }) {
   const tone = drill.type === "expense" ? P.debit : P.credit;
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+    <div className="modal-overlay fixed inset-0 z-40 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
       <div
-        style={{ background: P.surface, border: `1px solid ${P.line}` }}
-        className="rounded-lg w-full max-w-xl max-h-full flex flex-col overflow-hidden"
+        role="dialog"
+        aria-modal="true"
+        style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }}
+        className="modal-panel w-full max-w-xl max-h-full flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 px-4 py-3" style={{ borderBottom: `1px solid ${P.line}` }}>
@@ -2970,15 +3482,12 @@ function CategoryDrill({ drill, monthTx, month, onClose }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 px-4 py-2" style={{ borderBottom: `1px solid ${P.line}` }}>
-          <div className="flex gap-1">
-            {[["date", "by date"], ["amount", "by amount"]].map(([k, label]) => (
-              <button key={k} onClick={() => setSortBy(k)}
-                style={{ fontFamily: MONO, color: sortBy === k ? P.brass : P.faint, border: `1px solid ${sortBy === k ? P.brass : P.line}` }}
-                className="rounded px-2 py-0.5 text-xs">
-                {label}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            size="sm"
+            value={sortBy}
+            onChange={setSortBy}
+            options={[{ value: "date", label: "By date" }, { value: "amount", label: "By amount" }]}
+          />
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -2991,7 +3500,7 @@ function CategoryDrill({ drill, monthTx, month, onClose }) {
 
         <div className="overflow-y-auto p-4" style={{ maxHeight: "55vh" }}>
           {list.length === 0 ? (
-            <p style={{ color: P.faint }} className="text-sm py-6 text-center">No matching entries.</p>
+            <EmptyState compact icon={Search} title="No matching entries">Nothing in this category matches that search.</EmptyState>
           ) : (
             <div className="divide-y" style={{ borderColor: P.line }}>
               {list.map((t) => (
@@ -3034,7 +3543,7 @@ function BudgetTable({ title, rows, extra, type, monthTx, setPlanned, onDrill })
   const list = showAll ? [...rows, ...extra] : rows;
   const tone = type === "expense" ? P.debit : P.credit;
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <section style={cardStyle()} className="p-5">
       <div className="flex justify-between items-baseline mb-3">
         <h2 style={{ fontFamily: SERIF }} className="text-lg">{title}</h2>
         <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs">planned / actual</div>
@@ -3118,10 +3627,11 @@ function BudgetTable({ title, rows, extra, type, monthTx, setPlanned, onDrill })
   );
 }
 
-/* ================= Brasstally chat (capture + the finance agent) =================
-   Two modes share one transcript. Capture reads a receipt into a draft entry.
-   Ask runs the agent in lib/agent.js, which works the ledger with tools and can
-   propose changes — never make them. */
+/* ================= Tally, the assistant =================
+   One transcript, no modes. What you send decides what happens: a file or a
+   line with money in it is read into a draft entry, anything else goes to the
+   agent in lib/agent.js, which works the ledger with tools and can propose
+   changes — never make them. Tally also speaks first, see `brief` and `nudge`. */
 
 // What each tool is doing, in words, for the activity line under a question.
 const TOOL_LABEL = {
@@ -3153,19 +3663,20 @@ const DEFAULT_ASKS = [
 
 function Capture({
   data, addTx, addAR, addSub, month, embedded, balance, openBooks, recon, consolidation, bankConns,
-  insights = [], seed, onSeedUsed, guide, onGuideUsed, nudge, onNudgeUsed, apply, onGo,
+  insights = [], seed, onSeedUsed, guide, onGuideUsed, nudge, onNudgeUsed, brief, onBriefUsed, apply, onGo,
 }) {
   // A gap that's already been consolidated isn't news — opening the panel on a
   // ledger you reconciled yesterday should not greet you with it again.
   const drift = balance?.source === "bank" && balance.delta != null
     && Math.abs(balance.delta) >= 0.01 && !consolidation?.settled;
   const opener = drift
-    ? `Bank is ${fmt(balance.bank)}, books are ${fmt(balance.book)} (Δ ${fmt(balance.delta)}). Ask me to walk through it and I'll go through the entries. You can also drop a receipt or type an entry anytime.`
-    : "Drop a receipt or invoice, type something like “paid Vercel $70 today”, or ask me about the books. I can dig through your transactions, budgets, AR/AP, and cash to answer.";
-  const [mode, setMode] = useState(drift ? "help" : "capture"); // capture | help
+    ? `I'm Tally, I keep this ledger. Right now the bank says ${fmt(balance.bank)} and the books say ${fmt(balance.book)}, a gap of ${fmt(balance.delta)}. Ask me to walk it and I'll go entry by entry. You can also drop a receipt or type an entry any time.`
+    : "I'm Tally, I keep your books. Drop a receipt or an invoice, type something like “paid Vercel $70 today” and I'll file it, or just ask me about the money. I can dig through transactions, budgets, AR/AP, and cash to answer.";
   const [msgs, setMsgs] = useState([{ role: "assistant", text: opener }]);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
+  // Empty when idle, otherwise the line shown under the transcript. One piece
+  // of state instead of a boolean plus a mode to phrase it with.
+  const [busy, setBusy] = useState("");
   // Which section's brief the agent is carrying, if any. Cleared when the user
   // moves on to something the guide has nothing to say about.
   const [guideId, setGuideId] = useState(null);
@@ -3177,14 +3688,20 @@ function Capture({
   const convo = useRef([]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs, busy]);
 
-  // Surface a fresh drift notice once when balances first disagree after mount
+  const push = (m) => setMsgs((prev) => [...prev, m]);
+
+  // Balances that start agreeing and then disagree deserve a word, once. The
+  // opener already covers the case where they disagreed on arrival.
   useEffect(() => {
     if (!drift || greetedDrift.current) return;
     greetedDrift.current = true;
-    setMode("help");
-  }, [drift]);
-
-  const push = (m) => setMsgs((prev) => [...prev, m]);
+    if (msgs.length <= 1) return; // the opener said it
+    push({
+      role: "assistant",
+      text: `Your bank and your books just stopped agreeing: ${fmt(balance.bank)} against ${fmt(balance.book)}, a gap of ${fmt(balance.delta)}. Want me to walk it?`,
+      followUp: "Walk me through the gap between my bank balance and my books, line by line.",
+    });
+  }, [drift]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Tool calls collapse into a single activity line rather than one bubble each.
   const pushStep = (name) =>
@@ -3195,8 +3712,7 @@ function Capture({
     });
 
   const runTurn = async (question, useGuide = guideId) => {
-    setMode("help");
-    setBusy(true);
+    setBusy("working through the ledger…");
     const before = convo.current;
     const history = trimHistory([...before, { role: "user", content: question }]);
     try {
@@ -3225,7 +3741,7 @@ function Capture({
         link: drift ? { view: "reconcile", label: "Open consolidate" } : null,
       });
     }
-    setBusy(false);
+    setBusy("");
   };
 
   // `withGuide` is passed explicitly by the guide's own step buttons: setState
@@ -3252,9 +3768,23 @@ function Capture({
     if (!guide?.id || !GUIDES[guide.id]) return;
     onGuideUsed?.();
     setGuideId(guide.id);
-    setMode("help");
     push({ role: "assistant", text: guideOpener(guide.id), guideId: guide.id });
   }, [guide?.at]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ---- Tally noticing something and saying so ----
+     The finding is already computed and already worded (lib/insights.js), so
+     this costs nothing and arrives before the user thinks to ask. It comes with
+     the question attached: one tap sends the agent after the entries behind it. */
+  useEffect(() => {
+    if (!brief?.insight) return;
+    onBriefUsed?.();
+    const i = brief.insight;
+    push({
+      role: "assistant",
+      text: `${i.severity === "alert" ? "This one needs you" : i.severity === "warn" ? "Worth a look" : "One thing I noticed"}: ${i.title}. ${i.detail}`,
+      followUp: i.ask,
+    });
+  }, [brief?.at]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- money landed, so say so before being asked ----
      The whole point of a proactive message is that it arrives without a
@@ -3275,12 +3805,10 @@ function Capture({
         : `Heads up, ${fmt(nudge.total)} came in across ${nudge.received.length} payments.`,
       nudge: { received: nudge.received, due },
     });
-    setMode("help");
   }, [nudge?.at]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFile = async (file) => {
     if (!file) return;
-    setMode("capture");
     const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
     if (file.size > MAX_FILE_BYTES) {
       push({ role: "assistant", text: `That file is ${(file.size / 1048576).toFixed(1)} MB, I can file attachments up to 8 MB. Try exporting a smaller PDF or a screenshot of it.` });
@@ -3298,7 +3826,7 @@ function Capture({
     } else {
       push({ role: "user", image: URL.createObjectURL(file), text: "" });
     }
-    setBusy(true);
+    setBusy(isPdf ? "reading the document…" : "reading the receipt…");
     const att = { name: file.name || (isPdf ? "invoice.pdf" : "receipt.png"), type: isPdf ? "application/pdf" : (file.type || "image/png"), data: b64, file };
     try {
       const block = isPdf
@@ -3313,12 +3841,14 @@ function Capture({
     } catch (e) {
       push({ role: "assistant", text: `I couldn't read that one. ${friendlyError(e)}. Try a clearer file, or type the details (e.g. “Figma $45 on March 10”).` });
     }
-    setBusy(false);
+    setBusy("");
   };
 
-  // Capture mode files what you type; Ask mode answers it. The one crossover
-  // that matters is a question typed into Capture — "did I already pay Vercel?"
-  // should never become a $0 draft entry.
+  /* ---- where a typed line goes ----
+     With the mode switch gone the message itself decides, which is what people
+     expected the switch to be doing anyway. A question is answered; a line with
+     real money in it is filed; anything else is a question, because "did I pay
+     Vercel" must never become a $0 draft entry. */
   const looksLikeQuestion = (text) =>
     /\?/.test(text) ||
     /^\s*(why|how|what|when|which|where|who|should|can|could|would|do i|did i|am i|is my|are my|show|list|tell|explain|compare|find|check|help)\b/i.test(text);
@@ -3328,16 +3858,15 @@ function Capture({
     if (!text) return;
     setInput("");
     push({ role: "user", text });
-    if (mode === "help" || looksLikeQuestion(text)) {
+    // Parsed on-device first. It costs nothing, it decides where the message is
+    // going, and it's the draft we fall back to when the reader is unreachable —
+    // a typed line with an amount in it should never come back empty-handed.
+    const local = parseEntryText(text, { categories: data.categories, ledgerKind: data.ledger.kind });
+    if (looksLikeQuestion(text) || !(Number(local?.amount) > 0)) {
       await runTurn(text);
       return;
     }
-    setMode("capture");
-    setBusy(true);
-    // Parsed on-device first. It costs nothing, and it's the draft we fall back
-    // to when the reader is unreachable — a typed line with an amount in it
-    // should never come back empty-handed.
-    const local = parseEntryText(text, { categories: data.categories, ledgerKind: data.ledger.kind });
+    setBusy("filing that…");
     try {
       const raw = await askClaude(
         [{ type: "text", text: `${extractionPrompt(data.categories, data.ledger.name)}\n\nUser message: "${text}"` }],
@@ -3346,13 +3875,11 @@ function Capture({
       const draft = normalizeDraft(raw, { categories: data.categories, ledgerKind: data.ledger.kind, fallback: local });
       push({ role: "assistant", text: draft.note || "Got it, confirm or adjust:", draft });
     } catch (e) {
-      if (local) {
-        push({ role: "assistant", text: `${friendlyError(e)}, so I filled this in from your message. Check the category before saving.`, draft: local });
-      } else {
-        push({ role: "assistant", text: "I couldn't find an amount in that. Try including one, e.g. “paid Canva $40 yesterday”." });
-      }
+      // The local parse already found the amount, so the entry survives the
+      // reader being unreachable — only the category is a guess worth checking.
+      push({ role: "assistant", text: `${friendlyError(e)}, so I filled this in from your message. Check the category before saving.`, draft: local });
     }
-    setBusy(false);
+    setBusy("");
   };
 
   const saveDraft = async (draft, modeSave, att) => {
@@ -3392,42 +3919,21 @@ function Capture({
 
   return (
     <div
-      style={embedded ? {} : { background: P.surface, border: `1px solid ${P.line}` }}
+      style={embedded ? {} : cardStyle()}
       className={(embedded ? "" : "rounded-lg ") + "flex flex-col"}
     >
       {guideId && GUIDES[guideId] && (
         <div className="flex items-center gap-2 px-3 pt-2">
-          <span style={{ background: P.brass + "22", border: `1px solid ${P.brass}`, color: P.brass, fontFamily: MONO, width: 22, height: 22 }}
+          <span style={{ background: P.brass + "22", border: `1px solid ${P.brass}`, color: P.brassText, fontFamily: MONO, width: 22, height: 22 }}
             className="rounded-full text-xs flex items-center justify-center shrink-0">
             {GUIDES[guideId].avatar}
           </span>
           <span style={{ fontFamily: MONO, color: P.muted }} className="text-xs flex-1 truncate">{GUIDES[guideId].title}</span>
-          <button onClick={() => setGuideId(null)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">
+          <button onClick={() => setGuideId(null)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
             leave the guide
           </button>
         </div>
       )}
-      <div className="flex gap-1 px-3 pt-2">
-        {[
-          ["capture", "Capture"],
-          ["help", "Ask"],
-        ].map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            onClick={() => setMode(id)}
-            style={{
-              fontFamily: MONO,
-              color: mode === id ? P.brass : P.faint,
-              border: `1px solid ${mode === id ? P.brass : P.line}`,
-              background: mode === id ? (P.brass + "18") : "transparent",
-            }}
-            className="rounded-full px-2.5 py-0.5 text-xs"
-          >
-            {label}
-          </button>
-        ))}
-      </div>
       <div className="flex-1 overflow-y-auto p-4 space-y-3" style={{ maxHeight: embedded ? "45vh" : "55vh", minHeight: embedded ? 240 : 320 }}>
         {msgs.map((m, i) => (
           <div key={i} className={"flex " + (m.role === "user" ? "justify-end" : "justify-start")}>
@@ -3442,7 +3948,7 @@ function Capture({
               {m.image && <img src={m.image} alt="receipt" className="rounded mb-2 max-h-48" />}
               {m.pdfName && (
                 <div style={{ border: `1px solid ${P.line}`, color: P.text }} className="rounded px-2 py-1.5 mb-1 text-xs inline-flex items-center gap-1.5">
-                  <FileText size={13} style={{ color: P.brass }} /> {m.pdfName}
+                  <FileText size={13} style={{ color: P.brassText }} /> {m.pdfName}
                 </div>
               )}
               {m.text && <p style={{ color: m.role === "assistant" ? P.muted : P.text }} className="whitespace-pre-wrap">{m.text}</p>}
@@ -3450,7 +3956,7 @@ function Capture({
                 <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs space-y-0.5">
                   {m.steps.map((name, k) => (
                     <div key={k} className="flex items-center gap-1.5">
-                      <Search size={10} style={{ color: P.brass, flexShrink: 0 }} />
+                      <Search size={10} style={{ color: P.brassText, flexShrink: 0 }} />
                       {TOOL_LABEL[name] || name.replace(/_/g, " ")}
                     </div>
                   ))}
@@ -3467,6 +3973,17 @@ function Capture({
                   ))}
                 </div>
               )}
+              {/* Tally said something unprompted, and left the follow-up
+                  question on the table rather than making the user phrase it. */}
+              {m.followUp && (
+                <div className="mt-2">
+                  <button type="button" onClick={() => ask(m.followUp)}
+                    style={{ border: `1px solid ${P.brass}`, color: P.brassText, fontFamily: MONO }}
+                    className="rounded-full px-2.5 py-1 text-xs text-left inline-flex items-center gap-1.5">
+                    <Search size={11} /> Look into it
+                  </button>
+                </div>
+              )}
               {m.nudge && <NudgeCard nudge={m.nudge} data={data} apply={apply} onDone={(line) => push({ role: "assistant", text: line, done: true })} />}
               {m.draft && <DraftCard draft={m.draft} att={m.att} data={data} addSub={addSub} onSave={saveDraft} />}
               {m.proposal && <ProposalCard proposal={m.proposal} data={data} apply={apply} />}
@@ -3478,10 +3995,13 @@ function Capture({
             </div>
           </div>
         ))}
-        {/* Openers, drawn from what the local insight pass already found. */}
-        {msgs.length === 1 && !busy && (
+        {/* Openers, drawn from what the local insight pass already found. They
+            stay up until the first question, and never re-offer something Tally
+            has already put on the table unprompted. */}
+        {!msgs.some((m) => m.role === "user") && !busy && (
           <div className="flex flex-wrap gap-1.5 pt-1">
-            {[...insights.slice(0, 2).map((i) => i.ask), ...DEFAULT_ASKS]
+            {[...new Set([...insights.slice(0, 3).map((i) => i.ask), ...DEFAULT_ASKS])]
+              .filter((q) => !msgs.some((m) => m.followUp === q))
               .slice(0, 3)
               .map((q) => (
                 <button
@@ -3497,9 +4017,7 @@ function Capture({
           </div>
         )}
         {busy && (
-          <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs flex items-center gap-2">
-            <Loader2 size={12} className="animate-spin" /> {mode === "help" ? "working through the ledger…" : "reading…"}
-          </div>
+          <LoadingLine>{busy}</LoadingLine>
         )}
         <div ref={endRef} />
       </div>
@@ -3509,7 +4027,7 @@ function Capture({
           <Camera size={16} />
         </Btn>
         <Input
-          placeholder={mode === "help" ? "Ask about your books…" : "e.g. paid Vercel $70 today…"}
+          placeholder="Ask Tally, or type an entry…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !busy && handleText()}
@@ -3592,7 +4110,7 @@ function NudgeCard({ nudge, data, apply, onDone }) {
             );
           })}
           {outstanding.length > 0 && (
-            <button onClick={() => setDismissed(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">
+            <button onClick={() => setDismissed(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
               later
             </button>
           )}
@@ -3609,7 +4127,7 @@ function DraftCard({ draft, att, data, addSub, onSave }) {
   const set = (k, v) => setD((p) => ({ ...p, [k]: v }));
   if (saved) return <div style={{ color: P.credit, fontFamily: MONO }} className="text-xs mt-1">✓ saved{att ? " · file attached" : ""}</div>;
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mt-2 space-y-2 w-72 max-w-full">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mt-2 space-y-2 w-72 max-w-full">
       {att && (
         <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs flex items-center gap-1.5">
           <Paperclip size={11} /> {att.name} will be filed with this entry
@@ -3738,7 +4256,7 @@ function ProposalCard({ proposal, data, apply }) {
 
   return (
     <div style={{ background: P.bg, border: `1px solid ${P.brass}55` }} className="rounded-lg p-3 mt-2 space-y-2 w-72 max-w-full">
-      <div style={{ fontFamily: MONO, color: P.brass }} className="text-xs uppercase tracking-widest flex items-center gap-1.5">
+      <div style={{ fontFamily: MONO, color: P.brassText }} className="text-xs uppercase tracking-widest flex items-center gap-1.5">
         <Sparkles size={11} /> {spec.title}
       </div>
       {(input.reason || spec.note) && (
@@ -3824,7 +4342,7 @@ function TxAttachment({ tx, setTxAttachment, openPreview }) {
       <button
         onClick={() => openPreview(tx.attachmentId, tx.attachmentName)}
         title={`View ${tx.attachmentName || "filed document"}`}
-        style={{ color: P.brass, padding: 6, margin: -6 }}
+        style={{ color: P.brassText, padding: 6, margin: -6 }}
         className="shrink-0"
       >
         <Paperclip size={14} />
@@ -3936,7 +4454,7 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
   };
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <section style={cardStyle()} className="p-5">
       <div className="flex flex-wrap justify-between items-center gap-2 mb-4">
         <h2 style={{ fontFamily: SERIF }} className="text-lg">{monthLabel(month)}, {list.length} entries</h2>
         <div className="flex gap-2 items-center">
@@ -3969,7 +4487,7 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
       )}
 
       {adding && (
-        <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mb-4 grid sm:grid-cols-6 gap-2 items-end">
+        <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mb-4 grid sm:grid-cols-6 gap-2 items-end">
           <div><Label>Date</Label><Input type="date" value={form.date} onChange={(e) => set("date", e.target.value)} /></div>
           <div><Label>Amount</Label><Input type="number" placeholder="0.00" value={form.amount} onChange={(e) => set("amount", e.target.value)} /></div>
           <div>
@@ -4004,7 +4522,14 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
       )}
 
       {list.length === 0 ? (
-        <p style={{ color: P.faint }} className="text-sm py-8 text-center">{recOnly ? "No recurring entries this month." : "Nothing logged this month yet, add one above or capture a receipt."}</p>
+        <EmptyState
+          icon={recOnly ? Repeat : Receipt}
+          title={recOnly ? "No recurring entries this month" : "Nothing logged this month"}
+        >
+          {recOnly
+            ? "Entries you mark as recurring will collect here."
+            : "Add an entry above, or capture a receipt and let Tally read it."}
+        </EmptyState>
       ) : (
         <div className="divide-y" style={{ borderColor: P.line }}>
           {list.map((t) =>
@@ -4019,7 +4544,11 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
                 onCancel={() => setEditingId(null)}
               />
             ) : (
-              <div key={t.id} className="flex items-center gap-2 sm:gap-3 py-2.5" style={{ borderColor: P.line }}>
+              <div
+                key={t.id}
+                className="row-interactive flex items-center gap-2 sm:gap-3 py-2.5 px-2 -mx-2 rounded-md"
+                style={{ borderColor: P.line, "--row-hover": P.surface2 }}
+              >
                 <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs w-10 sm:w-12 shrink-0">{t.date?.slice(5)}</div>
                 <button onClick={() => setEditingId(t.id)} className="flex-1 min-w-0 text-left" title="Edit this entry">
                   <div className="text-sm truncate">{t.description}</div>
@@ -4036,7 +4565,7 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
                       </span>
                     )}
                     {isCredits(t) && (
-                      <span style={{ color: P.brass, border: `1px solid ${P.brass}` }} className="rounded px-1 shrink-0" title="Paid with credits, doesn't affect cash balance">
+                      <span style={{ color: P.brassText, border: `1px solid ${P.brass}` }} className="rounded px-1 shrink-0" title="Paid with credits, doesn't affect cash balance">
                         {creditName(data, t.creditId)}
                       </span>
                     )}
@@ -4052,12 +4581,25 @@ function Transactions({ data, monthTx, addTx, delTx, updateTx, setTxAttachment, 
                   <div style={{ fontFamily: MONO, color: t.type === "income" ? P.credit : P.text }} className="text-sm tabular-nums">
                     {t.type === "income" ? "+" : "−"}{fmt(t.amount)}
                   </div>
-                  <button onClick={() => setEditingId(t.id)} style={{ color: P.faint, padding: 6, margin: -6 }} title="Edit">
+                  <IconButton label="Edit" onClick={() => setEditingId(t.id)}>
                     <Pencil size={14} />
-                  </button>
-                  <button onClick={() => delTx(t.id)} style={{ color: P.faint, padding: 6, margin: -6 }} title="Delete">
+                  </IconButton>
+                  <IconButton
+                    label="Delete"
+                    onClick={async () => {
+                      // Transfers already ask; a plain entry deleted straight
+                      // from the row did not, and the row it removes is gone
+                      // from the month's totals with nothing to undo it.
+                      const ok = await askConfirm({
+                        title: "Delete this entry?",
+                        body: `${t.description || "This entry"} · ${fmt(t.amount)} on ${t.date}. It comes out of this month's totals.`,
+                        confirmLabel: "Delete",
+                      });
+                      if (ok) delTx(t.id);
+                    }}
+                  >
                     <Trash2 size={14} />
-                  </button>
+                  </IconButton>
                 </div>
               </div>
             )
@@ -4079,7 +4621,7 @@ function ChartTip({ show, children }) {
       style={{
         bottom: "100%", left: "50%", transform: "translateX(-50%)", marginBottom: 6,
         background: P.text, color: P.surface, fontFamily: MONO, whiteSpace: "nowrap",
-        padding: "3px 7px", borderRadius: 5, fontSize: 11, boxShadow: "0 4px 14px rgba(0,0,0,0.28)",
+        padding: "3px 7px", borderRadius: 5, fontSize: 11, boxShadow: elev(2),
       }}
     >
       {children}
@@ -4170,7 +4712,7 @@ function ProfitLoss({ data, month }) {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 stagger">
       <div className="flex gap-2 items-center">
         <div className="flex-1" />
         <Btn tone="ghost" onClick={exportCSV} title="Download this statement + underlying transactions as CSV">
@@ -4178,7 +4720,7 @@ function ProfitLoss({ data, month }) {
         </Btn>
       </div>
 
-      <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <section style={cardStyle()} className="p-5">
         <h2 style={{ fontFamily: SERIF }} className="text-lg mb-3">{monthLabel(month)} statement</h2>
         <div className="space-y-2" style={{ fontFamily: MONO }}>
           <PLRow label="Revenue" value={revenue} color={P.credit} change={revenueChange} />
@@ -4192,7 +4734,7 @@ function ProfitLoss({ data, month }) {
           {creditCosts > 0 && (
             <div style={{ color: P.faint }} className="flex justify-between text-xs pl-4">
               <span>covered by credits (no cash out)</span>
-              <span className="tabular-nums" style={{ color: P.brass }}>{fmt(-creditCosts)}</span>
+              <span className="tabular-nums" style={{ color: P.brassText }}>{fmt(-creditCosts)}</span>
             </div>
           )}
           <div style={{ borderTop: `1px double ${P.brass}` }} className="pt-2 flex justify-between text-base">
@@ -4212,7 +4754,7 @@ function ProfitLoss({ data, month }) {
       </section>
 
       {/* at-a-glance stats: burn rate, top category concentration, txn count — the numbers behind the statement above */}
-      <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <section style={cardStyle()} className="p-5">
         <h2 style={{ fontFamily: SERIF }} className="text-lg mb-3">At a glance</h2>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <StatTile label="Avg. daily spend" value={fmt(avgDailyCost)} hint={`over ${daysElapsed} ${daysElapsed === 1 ? "day" : "days"}`} />
@@ -4226,20 +4768,20 @@ function ProfitLoss({ data, month }) {
         </div>
       </section>
 
-      <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <section style={cardStyle()} className="p-5">
         <h2 style={{ fontFamily: SERIF }} className="text-lg mb-3">Where the money went</h2>
         {catRows.length === 0 ? (
           <p style={{ color: P.faint }} className="text-sm">No expenses in this view for {monthLabel(month)}.</p>
         ) : (
           <div className="space-y-2">
-            {catRows.map(([cat, v]) => (
-              <CatBarRow key={cat} cat={cat} value={v} max={maxCat} count={catCount[cat]} shareOfCosts={costs > 0 ? (v / costs) * 100 : null} />
+            {catRows.map(([cat, v], i) => (
+              <CatBarRow key={cat} index={i} cat={cat} value={v} max={maxCat} count={catCount[cat]} shareOfCosts={costs > 0 ? (v / costs) * 100 : null} />
             ))}
           </div>
         )}
       </section>
 
-      <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <section style={cardStyle()} className="p-5">
         <div className="flex items-baseline justify-between mb-3">
           <h2 style={{ fontFamily: SERIF }} className="text-lg">Six-month trend</h2>
           <div className="flex items-center gap-3 text-xs" style={{ color: P.faint, fontFamily: MONO }}>
@@ -4248,8 +4790,8 @@ function ProfitLoss({ data, month }) {
           </div>
         </div>
         <div className="flex items-end gap-3 h-32">
-          {trend.map((t) => (
-            <TrendBar key={t.m} t={t} maxTrend={maxTrend} active={t.m === month} />
+          {trend.map((t, i) => (
+            <TrendBar key={t.m} index={i} t={t} maxTrend={maxTrend} active={t.m === month} />
           ))}
         </div>
       </section>
@@ -4281,7 +4823,7 @@ const PLRow = ({ label, value, color, change, invertChange }) => (
 
 function StatTile({ label, value, hint }) {
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-md p-2.5">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-2.5">
       <div style={{ color: P.faint }} className="text-xs mb-1 truncate">{label}</div>
       <div style={{ fontFamily: MONO, color: P.text }} className="text-base tabular-nums">{value}</div>
       {hint && <div style={{ color: P.faint }} className="text-xs mt-0.5 truncate">{hint}</div>}
@@ -4289,7 +4831,7 @@ function StatTile({ label, value, hint }) {
   );
 }
 
-function CatBarRow({ cat, value, max, count, shareOfCosts }) {
+function CatBarRow({ cat, value, max, count, shareOfCosts, index = 0 }) {
   const [hover, setHover] = useState(false);
   return (
     <div
@@ -4300,7 +4842,17 @@ function CatBarRow({ cat, value, max, count, shareOfCosts }) {
     >
       <div className="w-32 text-sm truncate">{cat}</div>
       <div className="flex-1 h-2 rounded-full overflow-hidden relative" style={{ background: P.bg }}>
-        <div style={{ width: `${(value / max) * 100}%`, background: P.debit, opacity: 0.8 }} className="h-full">
+        <div
+          style={{
+            width: `${(value / max) * 100}%`,
+            background: P.debit,
+            opacity: 0.8,
+            // Rows draw in sequence, heaviest category first, so the ranking
+            // reads as it lands rather than appearing all at once.
+            animationDelay: `${Math.min(index, 8) * 45}ms`,
+          }}
+          className="h-full bar-rise-x"
+        >
           <ChartTip show={hover}>
             {fmt(value)}{shareOfCosts !== null ? ` · ${shareOfCosts.toFixed(0)}% of costs` : ""} · {count} {count === 1 ? "txn" : "txns"}
           </ChartTip>
@@ -4311,7 +4863,7 @@ function CatBarRow({ cat, value, max, count, shareOfCosts }) {
   );
 }
 
-function TrendBar({ t, maxTrend, active }) {
+function TrendBar({ t, maxTrend, active, index = 0 }) {
   const [hover, setHover] = useState(false);
   return (
     <div
@@ -4324,8 +4876,16 @@ function TrendBar({ t, maxTrend, active }) {
         {monthLabel(t.m)}: +{fmt(t.inc)} / −{fmt(t.exp)} · net {fmt(t.net)}
       </ChartTip>
       <div className="flex items-end gap-0.5 w-full justify-center" style={{ height: 96 }}>
-        <div style={{ height: `${(t.inc / maxTrend) * 100}%`, background: P.credit, width: "30%", minHeight: t.inc ? 2 : 0 }} className="rounded-t" />
-        <div style={{ height: `${(t.exp / maxTrend) * 100}%`, background: P.debit, width: "30%", minHeight: t.exp ? 2 : 0 }} className="rounded-t" />
+        {/* Months stagger left to right, income a beat ahead of spend, so the
+            pair reads as one gesture per month instead of a wall going up. */}
+        <div
+          style={{ height: `${(t.inc / maxTrend) * 100}%`, background: P.credit, width: "30%", minHeight: t.inc ? 2 : 0, animationDelay: `${index * 50}ms` }}
+          className="rounded-t bar-rise-y"
+        />
+        <div
+          style={{ height: `${(t.exp / maxTrend) * 100}%`, background: P.debit, width: "30%", minHeight: t.exp ? 2 : 0, animationDelay: `${index * 50 + 25}ms` }}
+          className="rounded-t bar-rise-y"
+        />
       </div>
       <div style={{ fontFamily: MONO, color: active ? P.brass : P.faint }} className="text-xs">
         {t.m.slice(5)}
@@ -4358,8 +4918,8 @@ function ARAP({ data, addAR, settleAR, delAR, removeSettled, updateAR, addSub, a
   };
 
   return (
-    <div className="space-y-6">
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <div className="space-y-6 stagger">
+      <div style={cardStyle()} className="p-5">
         <div className="flex flex-wrap justify-between items-start gap-4 mb-3">
           <Stat label="Owed to you" value={fmt(openAR)} color={P.credit} />
           <Stat label="You owe" value={fmt(openAP)} color={P.debit} />
@@ -4610,12 +5170,12 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
     {i.subcategory ? ` · ${i.subcategory}` : ""}
           </div>
           {isCredits(i) && (
-    <div style={{ fontFamily: MONO, color: P.brass }} className="text-xs">{creditName(data, i.creditId)} credits, no cash moves</div>
+    <div style={{ fontFamily: MONO, color: P.brassText }} className="text-xs">{creditName(data, i.creditId)} credits, no cash moves</div>
           )}
         </button>
         <div style={{ fontFamily: MONO, color: tone }} className="text-sm tabular-nums">{fmt(i.amount)}</div>
         {i.attachmentId && (
-          <button onClick={() => openPreview(i.attachmentId, i.attachmentName)} title={`View ${i.attachmentName || "invoice"}`} style={{ color: P.brass, padding: 6, margin: -6 }}>
+          <button onClick={() => openPreview(i.attachmentId, i.attachmentName)} title={`View ${i.attachmentName || "invoice"}`} style={{ color: P.brassText, padding: 6, margin: -6 }}>
     <Paperclip size={13} />
           </button>
         )}
@@ -4625,32 +5185,42 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
         <Btn tone="ghost" onClick={() => setSettleFor(i)} title={`${action}: confirm the actual amount, date, payment, and file the receipt`}>
           <Check size={13} />
         </Btn>
-        <button onClick={() => delAR(kind, i.id)} style={{ color: P.faint, padding: 6, margin: -6 }}><Trash2 size={13} /></button>
+        <IconButton
+          label="Delete"
+          onClick={async () => {
+            const ok = await askConfirm({
+              title: `Delete this ${kind === "receivables" ? "receivable" : "payable"}?`,
+              body: `${i.party || "This entry"}${i.description ? ` · ${i.description}` : ""} · ${fmt(i.amount)}. It stops counting toward your open books.`,
+              confirmLabel: "Delete",
+            });
+            if (ok) delAR(kind, i.id);
+          }}
+        >
+          <Trash2 size={13} />
+        </IconButton>
       </div>
     );
   };
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <section style={cardStyle()} className="p-5">
       <div className="flex justify-between items-center mb-3 gap-2">
         <h2 style={{ fontFamily: SERIF }} className="text-lg flex-1">{title}</h2>
         <input ref={fileRef} type="file" accept="image/*,application/pdf" className="hidden"
           onChange={(e) => { onInvoice(e.target.files[0]); e.target.value = ""; }} />
         {adding
           ? <button onClick={cancelAdd} style={{ color: P.muted }} className="text-sm px-1" title="Close">Cancel</button>
-          : <button onClick={() => setAdding(true)} style={{ color: P.brass }} className="text-sm px-1 inline-flex items-center gap-1">
+          : <button onClick={() => setAdding(true)} style={{ color: P.brassText }} className="text-sm px-1 inline-flex items-center gap-1">
               <Plus size={15} /> Add
             </button>}
       </div>
 
       {reading && (
-        <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs mb-3 flex items-center gap-2">
-          <Loader2 size={12} className="animate-spin" /> reading the invoice…
-        </div>
+        <LoadingLine className="mb-3">reading the invoice…</LoadingLine>
       )}
 
       {adding && (
-        <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mb-3 space-y-2">
+        <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mb-3 space-y-2">
           {att && (
             <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs flex items-center gap-1.5">
               <Paperclip size={11} /> {att.name} will be filed with this entry
@@ -4663,13 +5233,13 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
             {reading ? "reading the invoice…" : "Upload an invoice to fill this automatically"}
           </button>
           <ARFields kind={kind} f={form} set={set} data={data} addSub={addSub} addCredit={addCredit} />
-          {readErr && <p style={{ color: P.brass }} className="text-xs">{readErr}</p>}
+          {readErr && <p style={{ color: P.brassText }} className="text-xs">{readErr}</p>}
           <Btn className="w-full justify-center" onClick={submit}><Check size={14} /> Add</Btn>
         </div>
       )}
 
       {open.length === 0 && !adding ? (
-        <p style={{ color: P.faint }} className="text-sm py-3">Nothing open.</p>
+        <EmptyState compact icon={Check} title="Nothing open">Everything here is settled.</EmptyState>
       ) : (
         <div className="space-y-2">
           {openSeq.map((g) => {
@@ -4678,9 +5248,9 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
             const nextDue = g.items[0].dueDate;
             const expanded = !!openGroups[g.party];
             return (
-              <div key={"g:" + g.party} style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg overflow-hidden">
+              <div key={"g:" + g.party} style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="overflow-hidden">
                 <button onClick={() => toggleGroup(g.party)} className="w-full p-3 flex items-center gap-2 text-left">
-                  <ChevronDown size={15} style={{ color: P.brass, transform: expanded ? "none" : "rotate(-90deg)", transition: "transform .18s" }} className="shrink-0" />
+                  <ChevronDown size={15} style={{ color: P.brassText, transform: expanded ? "none" : "rotate(-90deg)", transition: "transform .18s" }} className="shrink-0" />
                   <div className="flex-1 min-w-0">
                     <div className="text-sm truncate">{g.party}</div>
                     <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs">
@@ -4734,7 +5304,7 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
                 <div key={gk}>
                   <button onClick={() => toggleGroup(gk)} style={{ color: P.muted, fontFamily: MONO }} className="text-xs flex justify-between items-center gap-2 py-1 w-full">
                     <span className="truncate flex items-center gap-1.5">
-                      <ChevronDown size={11} style={{ color: P.brass, transform: openGroups[gk] ? "none" : "rotate(-90deg)", transition: "transform .18s" }} />
+                      <ChevronDown size={11} style={{ color: P.brassText, transform: openGroups[gk] ? "none" : "rotate(-90deg)", transition: "transform .18s" }} />
                       <Lock size={10} style={{ color: P.faint }} />
                       {g.party}
                     </span>
@@ -4747,7 +5317,7 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
             return <SettledLine key={g.items[0].id} i={g.items[0]} />;
           })}
           {noteFor && (
-            <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mt-2">
+            <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mt-2">
               <div className="flex justify-between items-start gap-2">
                 <Label>Note · {noteFor.party}</Label>
                 <button onClick={() => setNoteFor(null)} style={{ color: P.faint }}><X size={12} /></button>
@@ -4760,7 +5330,7 @@ function ARList({ kind, title, items, data, addAR, settleAR, delAR, removeSettle
               </p>
               {noteFor.attachmentId && (
                 <button onClick={() => openPreview(noteFor.attachmentId, noteFor.attachmentName)}
-                  style={{ color: P.brass }} className="text-xs inline-flex items-center gap-1 mt-2">
+                  style={{ color: P.brassText }} className="text-xs inline-flex items-center gap-1 mt-2">
                   <Paperclip size={11} /> View filed invoice
                 </button>
               )}
@@ -4819,8 +5389,8 @@ function SettleModal({ kind, item, data, addCredit, action, onConfirm, onClose }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-sm p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+      <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-sm p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex justify-between items-start mb-1">
           <h3 style={{ fontFamily: SERIF }} className="text-lg">{action}</h3>
           <button onClick={onClose} style={{ color: P.muted }} className="p-1"><X size={16} /></button>
@@ -4848,8 +5418,8 @@ function SettleModal({ kind, item, data, addCredit, action, onConfirm, onClose }
           <input ref={fileRef} type="file" accept="image/*,application/pdf" className="hidden"
             onChange={(e) => { pickDoc(e.target.files[0]); e.target.value = ""; }} />
           {doc ? (
-            <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg px-3 py-2 flex items-center gap-2">
-              <Paperclip size={12} style={{ color: P.brass }} className="shrink-0" />
+            <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="px-3 py-2 flex items-center gap-2">
+              <Paperclip size={12} style={{ color: P.brassText }} className="shrink-0" />
               <span style={{ fontFamily: MONO }} className="text-xs truncate flex-1">{doc.name}</span>
               <button onClick={() => setDoc(null)} style={{ color: P.faint }} title="Remove"><X size={12} /></button>
             </div>
@@ -4869,11 +5439,11 @@ function SettleModal({ kind, item, data, addCredit, action, onConfirm, onClose }
         </div>
 
         {differs && (
-          <p style={{ color: P.brass, fontFamily: MONO }} className="text-xs mt-2">
+          <p style={{ color: P.brassText, fontFamily: MONO }} className="text-xs mt-2">
             estimated {fmt(item.amount)} → actual {fmt(parsed)}; the books record the actual
           </p>
         )}
-        {docErr && <p style={{ color: P.brass }} className="text-xs mt-2">{docErr}</p>}
+        {docErr && <p style={{ color: P.brassText }} className="text-xs mt-2">{docErr}</p>}
 
         <Btn className="w-full justify-center mt-4" disabled={!valid || saving} onClick={confirm}>
           {saving ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
@@ -4925,7 +5495,7 @@ function CreditsCard({ data, addCredit, updateCredit, delCredit }) {
   };
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <section style={cardStyle()} className="p-5">
       <div className="flex justify-between items-center mb-1 gap-2">
         <h2 style={{ fontFamily: SERIF }} className="text-lg">Credits</h2>
         <Btn tone="ghost" onClick={() => setAdding(!adding)}>{adding ? <X size={14} /> : <Plus size={14} />}</Btn>
@@ -4936,7 +5506,7 @@ function CreditsCard({ data, addCredit, updateCredit, delCredit }) {
       </p>
 
       {adding && (
-        <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mb-3 grid sm:grid-cols-4 gap-2 items-end">
+        <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mb-3 grid sm:grid-cols-4 gap-2 items-end">
           <div><Label>Name</Label><Input value={name} onChange={(e) => setName(e.target.value)} placeholder="MongoDB credits" /></div>
           <div><Label>Granted</Label><Input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="5000" /></div>
           <div><Label>Already used (before the app)</Label><Input type="number" value={used} onChange={(e) => setUsed(e.target.value)} placeholder="0" /></div>
@@ -4945,7 +5515,7 @@ function CreditsCard({ data, addCredit, updateCredit, delCredit }) {
       )}
 
       {pools.length === 0 && !adding ? (
-        <p style={{ color: P.faint }} className="text-sm py-2">No credit pools yet, add one with +, or pick "+ add a credit pool…" right inside any Paid via dropdown.</p>
+        <EmptyState compact icon={Coins} title="No credit pools yet">Add one with +, or pick "add a credit pool" inside any Paid via dropdown.</EmptyState>
       ) : (
         <div className="grid sm:grid-cols-2 gap-3">
           {pools.map((c) => {
@@ -4973,14 +5543,27 @@ function CreditsCard({ data, addCredit, updateCredit, delCredit }) {
             const tracked = trackedSpend(c.id);
             const usedPct = c.initial > 0 ? Math.min(Math.max(((c.initial - remaining) / c.initial) * 100, 0), 100) : 0;
             return (
-              <div key={c.id} style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3">
+              <div key={c.id} style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3">
                 <div className="flex justify-between items-baseline gap-2">
                   <button onClick={() => { setEditingId(c.id); setEdit({ name: c.name, initial: String(c.initial), usedAdjustment: String(c.usedAdjustment || 0) }); }} className="text-sm truncate text-left underline decoration-dotted underline-offset-2" style={{ color: P.text, textDecorationColor: P.faint }} title="Edit this pool">
                     {c.name}
                   </button>
                   <div className="flex gap-1 shrink-0">
                     <button onClick={() => { setEditingId(c.id); setEdit({ name: c.name, initial: String(c.initial), usedAdjustment: String(c.usedAdjustment || 0) }); }} style={{ color: P.faint, padding: 6, margin: -6 }} title="Edit"><Pencil size={12} /></button>
-                    <button onClick={() => { if (window.confirm(`Remove the ${c.name} pool? Past entries keep their credit tag.`)) delCredit(c.id); }} style={{ color: P.faint, padding: 6, margin: -6 }} title="Remove"><Trash2 size={12} /></button>
+                    <button
+                      onClick={async () => {
+                        const ok = await askConfirm({
+                          title: `Remove the ${c.name} pool?`,
+                          body: "Entries already paid from it keep their credit tag.",
+                          confirmLabel: "Remove pool",
+                        });
+                        if (ok) delCredit(c.id);
+                      }}
+                      style={{ color: P.faint, padding: 6, margin: -6 }}
+                      title="Remove"
+                    >
+                      <Trash2 size={12} />
+                    </button>
                   </div>
                 </div>
                 <div style={{ fontFamily: MONO, color: remaining > 0 ? P.credit : P.debit }} className="text-lg tabular-nums">
@@ -5022,7 +5605,7 @@ function CashCalendar({ data }) {
           {o.description || "·"}{isRec(o) ? ` · ${freqLabel(o.frequency || "monthly")}` : ""}{o.projected ? " · projected" : ""}
         </div>
       </div>
-      {isCredits(o) && <span style={{ fontFamily: MONO, color: P.brass, border: `1px solid ${P.brass}` }} className="text-xs rounded px-1">{creditName(data, o.creditId)}</span>}
+      {isCredits(o) && <span style={{ fontFamily: MONO, color: P.brassText, border: `1px solid ${P.brass}` }} className="text-xs rounded px-1">{creditName(data, o.creditId)}</span>}
       <div style={{ fontFamily: MONO, color: o.kind === "receivables" ? P.credit : P.debit }} className="text-sm tabular-nums">
         {o.kind === "receivables" ? "+" : "−"}{fmt(o.amount)}
       </div>
@@ -5030,15 +5613,12 @@ function CashCalendar({ data }) {
   );
 
   const ViewToggle = () => (
-    <div className="flex gap-1">
-      {[["list", "List"], ["grid", "Calendar"]].map(([k, label]) => (
-        <button key={k} onClick={() => setView(k)}
-          style={{ fontFamily: MONO, background: view === k ? P.surface2 : "transparent", border: `1px solid ${view === k ? P.brass : P.line}`, color: view === k ? P.text : P.muted }}
-          className="rounded px-3 py-1 text-xs">
-          {label}
-        </button>
-      ))}
-    </div>
+    <Segmented
+      size="sm"
+      value={view}
+      onChange={setView}
+      options={[{ value: "list", label: "List" }, { value: "grid", label: "Calendar" }]}
+    />
   );
 
   /* ---------- LIST VIEW ---------- */
@@ -5055,8 +5635,8 @@ function CashCalendar({ data }) {
     const prettyDate = (d) => new Date(d + "T00:00:00").toLocaleDateString("en-CA", { weekday: "short", month: "short", day: "numeric" });
 
     return (
-      <div className="space-y-6">
-        <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <div className="space-y-6 stagger">
+        <div style={cardStyle()} className="p-5">
           <div className="flex flex-wrap justify-between items-start gap-4 mb-3">
             <Stat label={`Expected in · ${span}d`} value={fmt(cashIn)} color={P.credit} />
             <Stat label={`Expected out · ${span}d`} value={fmt(cashOut)} color={P.debit} />
@@ -5082,7 +5662,7 @@ function CashCalendar({ data }) {
         </div>
 
         {overdue.length > 0 && (
-          <section style={{ background: P.surface, border: `1px solid ${P.debit}` }} className="rounded-lg p-4">
+          <section style={cardStyle({ tone: "debit" })} className="p-5">
             <h2 style={{ fontFamily: SERIF, color: P.debit }} className="text-lg mb-1">Overdue</h2>
             <div className="divide-y" style={{ borderColor: P.line }}>
               {overdue.map((o, i) => <div key={i} style={{ borderColor: P.line }}><Row o={o} /></div>)}
@@ -5090,10 +5670,10 @@ function CashCalendar({ data }) {
           </section>
         )}
 
-        <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+        <section style={cardStyle()} className="p-5">
           <h2 style={{ fontFamily: SERIF }} className="text-lg mb-2">Next {span} days</h2>
           {dates.length === 0 ? (
-            <p style={{ color: P.faint }} className="text-sm py-4">Nothing due in this window. Recurring receivables and payables you add will project here automatically.</p>
+            <EmptyState compact icon={CalendarDays} title="Nothing due in this window">Recurring receivables and payables project here automatically once you add them.</EmptyState>
           ) : (
             <div className="space-y-3">
               {dates.map((d) => (
@@ -5131,8 +5711,8 @@ function CashCalendar({ data }) {
   const dayItems = selectedDay ? byDay[selectedDay] || [] : [];
 
   return (
-    <div className="space-y-6">
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <div className="space-y-6 stagger">
+      <div style={cardStyle()} className="p-5">
         <div className="flex flex-wrap justify-between items-center gap-3 mb-3">
           <div className="flex items-center gap-2">
             <Btn tone="ghost" onClick={() => { setGridMonth(shiftMonth(gridMonth, -1)); setSelectedDay(null); }}>‹</Btn>
@@ -5184,12 +5764,12 @@ function CashCalendar({ data }) {
       </div>
 
       {selectedDay && (
-        <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+        <section style={cardStyle()} className="p-5">
           <h2 style={{ fontFamily: SERIF }} className="text-lg mb-1">
             {new Date(selectedDay + "T00:00:00").toLocaleDateString("en-CA", { weekday: "long", month: "long", day: "numeric" })}
           </h2>
           {dayItems.length === 0 ? (
-            <p style={{ color: P.faint }} className="text-sm py-2">Nothing due this day.</p>
+            <EmptyState compact icon={CalendarDays} title="Nothing due this day" />
           ) : (
             <div className="divide-y" style={{ borderColor: P.line }}>
               {dayItems.map((o, i) => <div key={i} style={{ borderColor: P.line }}><Row o={o} /></div>)}
@@ -5204,6 +5784,396 @@ function CashCalendar({ data }) {
   );
 }
 
+/* ================= Reports & analytics =================
+   Every other tab answers "how am I doing right now". This one answers "give me
+   the period, as a file" — the question you get from an accountant, a lender,
+   or a co-founder, and the one the app used to make you assemble by hand out of
+   a month-by-month P&L. Pick a window, read the figures on screen, hand any
+   block over as a CSV or a PDF.
+
+   Nothing here is a second source of truth: every number is recomputed from
+   data.transactions the same way the P&L computes it, just over a wider window. */
+
+const REPORT_RANGES = [
+  ["this-month", "This month"],
+  ["last-month", "Last month"],
+  ["3", "Last 3 months"],
+  ["6", "Last 6 months"],
+  ["12", "Last 12 months"],
+  ["ytd", "Year to date"],
+  ["fy", "Fiscal year"],
+  ["all", "All time"],
+];
+
+const lastDayOf = (ym) => {
+  const [y, m] = ym.split("-").map(Number);
+  return `${ym}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`;
+};
+
+/** [start, end, label] for a range key, as ISO dates. */
+function reportWindow(range, month, fye, txs) {
+  const end = lastDayOf(month);
+  const span = (fromMonth) => [`${fromMonth}-01`, end];
+  switch (range) {
+    case "last-month": {
+      const prev = shiftMonth(month, -1);
+      return [`${prev}-01`, lastDayOf(prev)];
+    }
+    case "3": return span(shiftMonth(month, -2));
+    case "6": return span(shiftMonth(month, -5));
+    case "12": return span(shiftMonth(month, -11));
+    case "ytd": return [`${month.slice(0, 4)}-01-01`, end];
+    case "fy": {
+      // The fiscal year the month on screen falls inside, not the calendar one.
+      const y = Number(month.slice(0, 4));
+      return fiscalWindow(fye, end.slice(5) <= fye ? y : y + 1);
+    }
+    case "all": {
+      const dates = txs.map((t) => t.date).filter(Boolean).sort();
+      return [dates[0] || `${month}-01`, dates[dates.length - 1] || end];
+    }
+    default: return span(month);
+  }
+}
+
+function ReportsTab({ data, month, balance, onAsk }) {
+  const [range, setRange] = useState("this-month");
+  const fye = data.ledger.fye || "12-31";
+  const stamp = data.ledger.name.replace(/[^\w]+/g, "");
+
+  const r = useMemo(() => {
+    const [from, to] = reportWindow(range, month, fye, data.transactions);
+    // plExclude is what the P&L honours (owner draws and the like), so the
+    // statement here matches that tab rather than quietly disagreeing with it.
+    const tx = data.transactions.filter((t) => t.date >= from && t.date <= to && !t.plExclude);
+    const revenue = tx.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
+    const costs = tx.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+    const recurring = tx.filter((t) => t.type === "expense" && isRec(t)).reduce((s, t) => s + t.amount, 0);
+    const onCredits = tx.filter((t) => t.type === "expense" && isCredits(t)).reduce((s, t) => s + t.amount, 0);
+
+    // Months the window actually touches, so "per month" divides by the right
+    // number and a partial first month still shows up as a bar.
+    const months = [];
+    for (let m = from.slice(0, 7); m <= to.slice(0, 7); m = shiftMonth(m, 1)) {
+      const mt = tx.filter((t) => t.date.startsWith(m));
+      const inc = mt.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
+      const exp = mt.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+      months.push({ m, inc, exp, net: inc - exp, count: mt.length });
+      if (months.length > 240) break; // an unparseable date can't run away with the loop
+    }
+
+    const byCat = {};
+    tx.filter((t) => t.type === "expense").forEach((t) => {
+      byCat[t.category] = byCat[t.category] || { amount: 0, count: 0 };
+      byCat[t.category].amount += t.amount;
+      byCat[t.category].count += 1;
+    });
+    const cats = Object.entries(byCat)
+      .map(([name, v]) => ({ name, ...v, share: costs > 0 ? (v.amount / costs) * 100 : 0 }))
+      .sort((a, b) => b.amount - a.amount);
+
+    const byIncomeCat = {};
+    tx.filter((t) => t.type === "income").forEach((t) => {
+      byIncomeCat[t.category] = (byIncomeCat[t.category] || 0) + t.amount;
+    });
+
+    const net = revenue - costs;
+    return {
+      from, to, tx, revenue, costs, recurring, onCredits, net,
+      margin: revenue > 0 ? (net / revenue) * 100 : null,
+      months, cats,
+      incomeCats: Object.entries(byIncomeCat).sort((a, b) => b[1] - a[1]),
+      perMonth: months.length ? net / months.length : 0,
+      burnPerMonth: months.length ? costs / months.length : 0,
+    };
+  }, [data.transactions, range, month, fye]);
+
+  const label = `${longDate(r.from)} to ${longDate(r.to)}`;
+  const obs = useMemo(() => obligationsView(data, { status: "all", limit: 100 }), [data]);
+  const rec = useMemo(() => recurringCosts(data), [data]);
+
+  /* ---- the exports ----
+     One shape per report: a name, a line saying what's in it, and the buttons
+     that produce it. Everything is generated on the device from state already
+     in memory, so nothing here needs the network. */
+  const statementRows = () => [
+    { name: "Revenue", amount: r.revenue },
+    { name: "Costs and expenses", amount: -r.costs },
+    // Only worth a line when there is something on it. A statement full of
+    // zeroes reads as a broken export rather than a quiet month.
+    ...(r.recurring > 0 ? [
+      { name: "of which recurring", amount: -r.recurring },
+      { name: "of which one-time", amount: -(r.costs - r.recurring) },
+    ] : []),
+    ...(r.onCredits > 0 ? [{ name: "of which covered by credits (non-cash)", amount: -r.onCredits }] : []),
+    { name: `Net ${r.net >= 0 ? "profit" : "loss"}`, amount: r.net, strong: true, final: true },
+  ];
+
+  const exportStatementCSV = () => {
+    downloadCSV(`Statement_${stamp}_${r.from}_${r.to}.csv`, [
+      [`Income statement, ${data.ledger.name}`, label],
+      [],
+      ...statementRows().map((x) => [x.name, x.amount.toFixed(2)]),
+      ["Margin", r.margin !== null ? `${r.margin.toFixed(1)}%` : "n/a"],
+      ["Average net per month", r.perMonth.toFixed(2)],
+      ["Average spend per month", r.burnPerMonth.toFixed(2)],
+      [],
+      ["Income by category"],
+      ...r.incomeCats.map(([c, v]) => [c, v.toFixed(2)]),
+      [],
+      ["Expenses by category", "Amount", "Share of costs", "Entries"],
+      ...r.cats.map((c) => [c.name, c.amount.toFixed(2), `${c.share.toFixed(1)}%`, c.count]),
+    ]);
+  };
+
+  const exportStatementPDF = () => {
+    formPdf({
+      filename: `Statement_${stamp}_${r.from}_${r.to}.pdf`,
+      formTitle: "Income statement",
+      formSub: `${data.ledger.name} · ${label}`,
+      banner: "",
+      footer: `Prepared in Brasstally · ${todayStr()} · cash basis, from the ${data.ledger.name} ledger`,
+      codeWidth: 0,
+      ident: [
+        ["Ledger", `${data.ledger.name} (${kindLabel(data.ledger.kind)})`],
+        ["Period", label],
+        ["Currency", data.ledger.currency || "CAD"],
+        ["Entries", String(r.tx.length)],
+      ],
+      columns: ["", "Line", "Amount"],
+      rows: [
+        ...statementRows(),
+        { section: "Expenses by category" },
+        ...r.cats.map((c) => ({ name: `${c.name} (${c.share.toFixed(0)}%)`, amount: -c.amount })),
+        { name: "Total expenses", amount: -r.costs, strong: true },
+        { section: "By month" },
+        ...r.months.map((m) => ({ name: monthLabel(m.m), amount: m.net })),
+      ],
+      note: (r.onCredits > 0 ? `${pdfMoney(r.onCredits)} of the expenses above were covered by credit pools and never moved cash. ` : "")
+        + "Cash basis: open receivables and payables are not included until they settle. "
+        + `Open at the time of writing: ${fmt(obs.receivables?.items.filter((i) => i.status === "open").reduce((s, i) => s + i.amount, 0) || 0)} owed to the ledger, `
+        + `${fmt(obs.payables?.items.filter((i) => i.status === "open").reduce((s, i) => s + i.amount, 0) || 0)} owed out.`,
+    });
+  };
+
+  const exportTransactionsCSV = () => {
+    downloadCSV(`Transactions_${stamp}_${r.from}_${r.to}.csv`, [
+      [`Transactions, ${data.ledger.name}`, label],
+      [],
+      ["Date", "Description", "Category", "Subcategory", "Type", "Frequency", "Paid with", "Receipt", "Amount"],
+      ...[...r.tx]
+        .sort((a, b) => (a.date || "").localeCompare(b.date || ""))
+        .map((t) => [
+          t.date, t.description, t.category, t.subcategory || "", t.type,
+          isRec(t) ? "Recurring" : "One-time", isCredits(t) ? "Credits" : "Cash",
+          t.attachmentId ? (t.attachmentName || "yes") : "",
+          (t.type === "income" ? t.amount : -t.amount).toFixed(2),
+        ]),
+    ]);
+  };
+
+  const exportMonthlyCSV = () => {
+    downloadCSV(`Monthly_${stamp}_${r.from}_${r.to}.csv`, [
+      [`Month by month, ${data.ledger.name}`, label],
+      [],
+      ["Month", "Income", "Expenses", "Net", "Entries"],
+      ...r.months.map((m) => [m.m, m.inc.toFixed(2), (-m.exp).toFixed(2), m.net.toFixed(2), m.count]),
+    ]);
+  };
+
+  const exportObligationsCSV = () => {
+    const rows = ["receivables", "payables"].flatMap((k) =>
+      (obs[k]?.items || []).map((i) => [
+        k === "receivables" ? "Owed to you" : "You owe",
+        i.party, i.description || "", i.dueDate || "", i.status,
+        i.settledOn || "", i.daysOverdue || "", i.recurring ? "Recurring" : "One-time",
+        i.amount.toFixed(2),
+      ]),
+    );
+    downloadCSV(`AR_AP_${stamp}_${todayStr()}.csv`, [
+      [`Receivables and payables, ${data.ledger.name}`, `as at ${longDate(todayStr())}`],
+      [],
+      ["Side", "Party", "Description", "Due", "Status", "Settled on", "Days overdue", "Frequency", "Amount"],
+      ...rows,
+    ]);
+  };
+
+  const exportRecurringCSV = () => {
+    downloadCSV(`Recurring_${stamp}_${todayStr()}.csv`, [
+      [`Recurring costs, ${data.ledger.name}`, `as at ${longDate(todayStr())}`],
+      [],
+      ["Merchant", "Category", "Latest amount", "Latest date", "Times seen", "Last price change", "Paid with"],
+      ...rec.subscriptions.map((s) => [
+        s.name, s.category, s.latestAmount.toFixed(2), s.latestDate, s.occurrences,
+        s.priceChanged ? `${s.priceChanged.change >= 0 ? "+" : ""}${s.priceChanged.change.toFixed(2)} on ${s.priceChanged.on}` : "",
+        s.paidWith,
+      ]),
+      [],
+      ["Scheduled obligations"],
+      ["Side", "Party", "Amount", "Frequency", "Next due", "Monthly equivalent"],
+      ...rec.scheduledObligations.map((s) => [
+        s.kind === "receivables" ? "Owed to you" : "You owe",
+        s.party, s.amount.toFixed(2), s.frequency, s.nextDue || "", s.monthlyEquivalent.toFixed(2),
+      ]),
+    ]);
+  };
+
+  const reports = [
+    {
+      title: "Income statement",
+      sub: `Revenue, costs, and net for the period, with the category breakdown behind it.`,
+      csv: exportStatementCSV, pdf: exportStatementPDF,
+    },
+    {
+      title: "Transaction ledger",
+      sub: `Every one of the ${r.tx.length} ${r.tx.length === 1 ? "entry" : "entries"} in the period, with category, frequency, and whether a receipt is filed.`,
+      csv: exportTransactionsCSV,
+    },
+    {
+      title: "Month by month",
+      sub: `Income, expenses, and net for each of the ${r.months.length} ${r.months.length === 1 ? "month" : "months"} in the window.`,
+      csv: exportMonthlyCSV,
+    },
+    {
+      title: "Receivables and payables",
+      sub: "Every open and settled obligation as it stands today, with ageing. Not period-bound, because what is owed is owed now.",
+      csv: exportObligationsCSV,
+    },
+    {
+      title: "Recurring costs",
+      sub: `${rec.subscriptions.length} recurring ${rec.subscriptions.length === 1 ? "charge" : "charges"} grouped by merchant, plus every scheduled obligation and what it costs a month.`,
+      csv: exportRecurringCSV,
+    },
+  ];
+
+  const maxMonth = Math.max(...r.months.flatMap((m) => [m.inc, m.exp]), 1);
+  const maxCat = Math.max(...r.cats.map((c) => c.amount), 1);
+
+  return (
+    <div className="space-y-6 stagger">
+      <section style={cardStyle()} className="p-5">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="w-52">
+            <Label>Period</Label>
+            <Select value={range} onChange={(e) => setRange(e.target.value)}>
+              {REPORT_RANGES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+            </Select>
+          </div>
+          <div className="flex-1 min-w-40">
+            <div style={{ color: P.faint, fontFamily: MONO }} className="text-xs">{label}</div>
+            <div style={{ color: P.muted }} className="text-sm">
+              {r.tx.length} {r.tx.length === 1 ? "entry" : "entries"} across {r.months.length} {r.months.length === 1 ? "month" : "months"}
+            </div>
+          </div>
+          <Btn tone="ghost" onClick={exportStatementPDF} title="The income statement for this period as a PDF">
+            <FileText size={14} /> Statement PDF
+          </Btn>
+        </div>
+      </section>
+
+      <section style={cardStyle()} className="p-5">
+        <h2 style={{ fontFamily: SERIF }} className="text-lg mb-3">The period in six numbers</h2>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <StatTile label="Revenue" value={fmt(r.revenue)} hint={`${r.incomeCats.length} ${r.incomeCats.length === 1 ? "source" : "sources"}`} />
+          <StatTile label="Costs" value={fmt(r.costs)} hint={r.onCredits > 0 ? `${fmt(r.onCredits)} on credits` : `${r.cats.length} ${r.cats.length === 1 ? "category" : "categories"}`} />
+          <StatTile label={`Net ${r.net >= 0 ? "profit" : "loss"}`} value={fmt(r.net)} hint={r.margin !== null ? `${r.margin.toFixed(0)}% margin` : "no revenue"} />
+          <StatTile label="Spend per month" value={fmt(r.burnPerMonth)} hint={`over ${r.months.length} ${r.months.length === 1 ? "month" : "months"}`} />
+          <StatTile label="Net per month" value={fmt(r.perMonth)} hint={r.perMonth >= 0 ? "building" : "drawing down"} />
+          <StatTile label="Balance today" value={fmt(balance?.value ?? 0)} hint={balance?.source === "bank" ? "from the bank" : "from the books"} />
+        </div>
+        {r.recurring > 0 && (
+          <p style={{ color: P.faint }} className="text-xs mt-3">
+            {fmt(r.recurring)} of the costs are recurring, {fmt(r.costs - r.recurring)} one-time.
+          </p>
+        )}
+      </section>
+
+      <section style={cardStyle()} className="p-5">
+        <div className="flex items-baseline justify-between mb-3 gap-3 flex-wrap">
+          <h2 style={{ fontFamily: SERIF }} className="text-lg">Month by month</h2>
+          <div className="flex items-center gap-3 text-xs" style={{ color: P.faint, fontFamily: MONO }}>
+            <span className="inline-flex items-center gap-1"><span style={{ width: 8, height: 8, borderRadius: 2, background: P.credit, display: "inline-block" }} /> income</span>
+            <span className="inline-flex items-center gap-1"><span style={{ width: 8, height: 8, borderRadius: 2, background: P.debit, display: "inline-block" }} /> expense</span>
+          </div>
+        </div>
+        {r.months.length === 0 ? (
+          <p style={{ color: P.faint }} className="text-sm">Nothing recorded in this period.</p>
+        ) : (
+          /* A twelve-month window scrolls sideways, and a scroll container clips
+             in both axes, so the bar tooltips need room reserved above them. */
+          <div className="flex items-end gap-2 overflow-x-auto pt-7 pb-1" style={{ minHeight: 128 }}>
+            {r.months.map((m, i) => (
+              <div key={m.m} style={{ minWidth: 34 }} className="flex-1">
+                <TrendBar index={i} t={m} maxTrend={maxMonth} active={m.m === month} />
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section style={cardStyle()} className="p-5">
+        <h2 style={{ fontFamily: SERIF }} className="text-lg mb-3">Where the money went</h2>
+        {r.cats.length === 0 ? (
+          <p style={{ color: P.faint }} className="text-sm">No expenses in this period.</p>
+        ) : (
+          <div className="space-y-2">
+            {r.cats.map((c, i) => (
+              <CatBarRow key={c.name} index={i} cat={c.name} value={c.amount} max={maxCat} count={c.count} shareOfCosts={c.share} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section style={cardStyle()} className="p-5">
+        <div className="flex items-start justify-between gap-3 flex-wrap mb-1">
+          <div>
+            <h2 style={{ fontFamily: SERIF }} className="text-lg leading-tight">Export</h2>
+            <p style={{ color: P.muted }} className="text-sm">
+              Built on your device from what is already on screen. CSV opens anywhere; PDF is the one you send.
+            </p>
+          </div>
+        </div>
+        <div className="divide-y mt-3" style={{ borderColor: P.line }}>
+          {reports.map((rep) => (
+            <div key={rep.title} className="py-3 flex items-start gap-3 flex-wrap" style={{ borderColor: P.line }}>
+              <div className="flex-1 min-w-48">
+                <div style={{ color: P.text }} className="text-sm">{rep.title}</div>
+                <p style={{ color: P.faint }} className="text-xs mt-0.5">{rep.sub}</p>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                <Btn tone="ghost" onClick={rep.csv}><Download size={13} /> CSV</Btn>
+                {rep.pdf && <Btn tone="ghost" onClick={rep.pdf}><FileText size={13} /> PDF</Btn>}
+              </div>
+            </div>
+          ))}
+        </div>
+        <p style={{ color: P.faint }} className="text-xs mt-3">
+          Filing a return is next door under Connectors, where the same figures are mapped onto CRA's own schedules.
+        </p>
+      </section>
+
+      {onAsk && (
+        <section style={cardStyle()} className="p-5">
+          <h2 style={{ fontFamily: SERIF }} className="text-lg mb-1">Ask about the period</h2>
+          <p style={{ color: P.muted }} className="text-sm mb-3">Tally reads the same entries these figures came from.</p>
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              `Summarise ${longDate(r.from)} to ${longDate(r.to)}: what changed, and what should I do about it?`,
+              "Which categories grew the most over this period, and why?",
+              "What are my recurring costs totalling a year, and which ones went up?",
+            ].map((q) => (
+              <button key={q} type="button" onClick={() => onAsk(q)}
+                style={{ border: `1px solid ${P.line}`, color: P.muted, fontFamily: MONO }}
+                className="rounded-full px-2.5 py-1 text-xs text-left">
+                {q}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
 
 /* ================= floating dock button ================= */
 function DockBtn({ label, active, onClick, children }) {
@@ -5213,8 +6183,10 @@ function DockBtn({ label, active, onClick, children }) {
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      type="button"
       title={label}
       aria-label={label}
+      aria-current={active ? "page" : undefined}
       className="dock-btn relative rounded-full flex items-center justify-center shrink-0"
       style={{
         color: active ? "#10120C" : P.muted,
@@ -5238,22 +6210,23 @@ function DockBtn({ label, active, onClick, children }) {
 
 /* ================= first-visit tutorials ================= */
 const TOUR_COPY = {
-  overview: ["Your month at a glance", "Planned versus actual, per category. Tap a planned amount to set a budget, tap a category name to see the entries behind it, and use the Brasstally bubble in the corner to capture receipts or ask about balance drift."],
+  overview: ["Your month at a glance", "Planned versus actual, per category. Tap a planned amount to set a budget, tap a category name to see the entries behind it, and tap Tally in the corner to capture receipts or ask about balance drift."],
   transactions: ["Every entry lives here", "Add one manually, import a whole bank statement, or use Transfer to move money between your ledgers. Tap the pencil on any row to edit it, and the paperclip to file its receipt."],
   pl: ["Your profit and loss", "Switch between business, personal, and combined scope. Owner draws are excluded, credit-paid costs get their own line, and Export produces a CSV your accountant can use as is."],
   arap: ["Who owes you, who you owe", "Upload an invoice and the fields fill themselves. Recurring items queue their next occurrence automatically when you settle them. Tap any open item to edit everything about it."],
   credits: ["Money that isn't cash", "Pools for AWS credits, compute credits, and the like. Anything paid via a pool draws the pool down instead of your bank balance. Tap a pool to edit it, including credits used before you started tracking."],
   calendar: ["What's coming due", "List view shows the next 30 or 90 days. Calendar view is a month grid, and recurring items are projected onto their future dates. Tap a day to see what lands on it."],
   integrations: ["The outside world", "Connect your bank with Plaid right here, and new transactions arrive in a review you confirm. Tax drafts map your year onto CRA's forms, compute deadlines, and prep the accountant email."],
+  reports: ["The year, as a file", "Pick a period and the whole ledger is cut to it: the statement, the months behind it, and where the money went. Every block exports as a CSV your spreadsheet opens or a PDF you can send."],
 };
 
 function TourCard({ tab, onDismiss }) {
   const copy = TOUR_COPY[tab];
   if (!copy) return null;
   return (
-    <div style={{ background: P.surface, border: `1px solid ${P.line}`, borderLeft: `3px solid ${P.brass}` }} className="rounded-lg p-4 mb-5 flex items-start gap-3">
+    <div style={{ ...cardStyle(), borderLeft: `3px solid ${P.brass}` }} className="rounded-lg p-4 mb-5 flex items-start gap-3">
       <div className="flex-1">
-        <div style={{ fontFamily: MONO, color: P.brass }} className="text-xs uppercase tracking-widest mb-1">First time here</div>
+        <div style={{ fontFamily: MONO, color: P.brassText }} className="text-xs uppercase tracking-widest mb-1">First time here</div>
         <div style={{ fontFamily: SERIF }} className="text-base mb-1">{copy[0]}</div>
         <p style={{ color: P.muted }} className="text-sm">{copy[1]}</p>
       </div>
@@ -5278,7 +6251,7 @@ function NewLedgerModal({ onboarding, onCreate, onClose, onSignOut }) {
   };
 
   const body = (
-    <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
       <div className="flex justify-between items-start mb-1">
         <h3 style={{ fontFamily: SERIF }} className="text-xl">{onboarding ? "Set up your first ledger" : "New ledger"}</h3>
         {!onboarding && <button onClick={onClose} style={{ color: P.muted }} className="p-1"><X size={16} /></button>}
@@ -5293,16 +6266,13 @@ function NewLedgerModal({ onboarding, onCreate, onClose, onSignOut }) {
         </div>
         <div>
           <Label>Type</Label>
-          <div className="flex gap-1">
-            {[["business", "Business Ledger"], ["personal", "Personal Ledger"]].map(([k, label]) => (
-              <button key={k} onClick={() => setKind(k)}
-                style={{ background: kind === k ? P.surface2 : "transparent", border: `1px solid ${kind === k ? P.brass : P.line}`, color: kind === k ? P.text : P.muted }}
-                className="flex-1 rounded px-2 py-1.5 text-sm">
-                {label}
-              </button>
-            ))}
-          </div>
-          <p style={{ color: P.faint }} className="text-xs mt-1">
+          <Segmented
+            full
+            value={kind}
+            onChange={setKind}
+            options={[{ value: "business", label: "Business" }, { value: "personal", label: "Personal" }]}
+          />
+          <p style={{ color: P.faint }} className="text-xs mt-2">
             {kind === "business" ? "A Business Ledger starts with revenue, salaries, software, and hosting categories, and unlocks the CRA T2 draft." : "A Personal Ledger starts with home, food, and transport categories, and keeps your own money out of the company's books."}
           </p>
         </div>
@@ -5310,8 +6280,8 @@ function NewLedgerModal({ onboarding, onCreate, onClose, onSignOut }) {
           <div><Label>Current balance</Label><Input type="number" value={bal} onChange={(e) => setBal(e.target.value)} placeholder="0.00" /></div>
           <div><Label>As of</Label><Input type="date" value={asOf} onChange={(e) => setAsOf(e.target.value)} /></div>
         </div>
-        <Btn className="w-full justify-center" disabled={busy || !name.trim()} onClick={submit}>
-          {busy ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />} Create ledger
+        <Btn className="w-full" size="lg" loading={busy} disabled={!name.trim()} onClick={submit}>
+          {!busy && <Check size={15} />} Create ledger
         </Btn>
         {onboarding && (
           <button onClick={onSignOut} style={{ color: P.faint, fontFamily: MONO }} className="w-full text-center text-xs underline decoration-dotted">sign out</button>
@@ -5322,12 +6292,12 @@ function NewLedgerModal({ onboarding, onCreate, onClose, onSignOut }) {
 
   if (onboarding)
     return (
-      <div style={{ background: P.bg, minHeight: "100vh", fontFamily: SANS, color: P.text }} className="flex items-center justify-center p-4">
+      <div style={{ background: P.bg, minHeight: "100dvh", fontFamily: SANS, color: P.text }} className="flex items-center justify-center p-4">
         {body}
       </div>
     );
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
       {body}
     </div>
   );
@@ -5361,8 +6331,8 @@ function SetupChecklist({ data, bankConns, onGo, openGuide, onDismiss }) {
     {
       id: "entry", done: hasEntry,
       title: "Put something in the books",
-      sub: "Photograph a receipt, or just type what you paid. Either way it reads the amount, the merchant, and the date for you.",
-      action: ["Capture something", () => onGo("capture")],
+      sub: "Photograph a receipt, or just type what you paid. Either way Tally reads the amount, the merchant, and the date for you.",
+      action: ["Show Tally", () => onGo("capture")],
     },
     {
       id: "budget", done: hasBudget,
@@ -5382,13 +6352,13 @@ function SetupChecklist({ data, bankConns, onGo, openGuide, onDismiss }) {
   if (doneCount === steps.length) return null;
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.brass}` }} className="rounded-lg p-5 mb-6">
+    <section style={cardStyle({ tone: "brass", level: 2 })} className="p-5 mb-6">
       <div className="flex items-start justify-between gap-3">
         <div>
           <h2 style={{ fontFamily: SERIF }} className="text-lg leading-tight">Getting set up</h2>
           <p style={{ color: P.muted }} className="text-sm">{doneCount} of {steps.length} done. This card goes away by itself.</p>
         </div>
-        <button onClick={onDismiss} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted shrink-0">
+        <button onClick={onDismiss} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 shrink-0">
           hide it
         </button>
       </div>
@@ -5436,12 +6406,20 @@ const gifiFor = (category, subcategory) => {
   return { code: "9270", name: "Other expenses" };
 };
 
-/* CRA-form-styled PDF: line codes, right-ruled amounts, parenthesized negatives, draft banner */
+/* Form-styled PDF: line codes, right-ruled amounts, parenthesized negatives.
+   Built for CRA schedules, which is why the banner and footer say "draft" by
+   default — the Reports tab prints its own statements through here and passes
+   its own, and sets codeWidth to 0 for a sheet with no line-code column. */
 const pdfMoney = (n) => (n < 0 ? "(" : "") + Math.abs(n).toLocaleString("en-CA", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + (n < 0 ? ")" : "");
 
-function taxPdf({ filename, formTitle, formSub, ident, columns, rows, note }) {
+function formPdf({
+  filename, formTitle, formSub, ident, columns, rows, note,
+  banner = "DRAFT · for preparation only",
+  footer = `Prepared in Brasstally · ${todayStr()} · draft for use with CRA-certified software, not a filed return`,
+  codeWidth = 24,
+}) {
   const doc = new jsPDF({ unit: "mm", format: "letter" });
-  const W = 215.9, L = 16, R = W - 16;
+  const W = 215.9, L = 16, R = W - 16, NX = L + codeWidth;
   let y = 18;
   const hr = (yy, dark) => { doc.setDrawColor(dark ? 60 : 150); doc.setLineWidth(dark ? 0.4 : 0.2); doc.line(L, yy, R, yy); };
   const pageBreak = () => { if (y > 260) { doc.addPage(); y = 18; } };
@@ -5449,7 +6427,7 @@ function taxPdf({ filename, formTitle, formSub, ident, columns, rows, note }) {
   doc.setFont("helvetica", "bold"); doc.setFontSize(14);
   doc.text(formTitle, L, y);
   doc.setFont("helvetica", "normal"); doc.setFontSize(9);
-  doc.text("DRAFT · for preparation only", R, y, { align: "right" });
+  if (banner) doc.text(banner, R, y, { align: "right" });
   y += 5.5;
   doc.setFontSize(10);
   doc.text(formSub, L, y);
@@ -5465,8 +6443,8 @@ function taxPdf({ filename, formTitle, formSub, ident, columns, rows, note }) {
   y += 1.5; hr(y); y += 6;
 
   doc.setFont("helvetica", "bold"); doc.setFontSize(8);
-  doc.text(columns[0], L, y);
-  doc.text(columns[1], L + 24, y);
+  if (codeWidth) doc.text(columns[0], L, y);
+  doc.text(columns[1], NX, y);
   doc.text(columns[2], R, y, { align: "right" });
   y += 2.5; hr(y, true); y += 5.5;
 
@@ -5483,8 +6461,8 @@ function taxPdf({ filename, formTitle, formSub, ident, columns, rows, note }) {
     }
     doc.setFont("helvetica", r.strong ? "bold" : "normal");
     if (r.final) { doc.setDrawColor(40); doc.setLineWidth(0.3); doc.line(L + 128, y - 4.4, R, y - 4.4); doc.line(L + 128, y - 3.6, R, y - 3.6); }
-    if (r.code) doc.text(String(r.code), L, y);
-    doc.text(doc.splitTextToSize(r.name, 116)[0], L + 24, y);
+    if (r.code && codeWidth) doc.text(String(r.code), L, y);
+    doc.text(doc.splitTextToSize(r.name, R - NX - 26)[0], NX, y);
     if (r.amount !== null && r.amount !== undefined) doc.text(pdfMoney(r.amount), R, y, { align: "right" });
     y += 5.5;
     if (r.strong && !r.final) hr(y - 4);
@@ -5500,7 +6478,7 @@ function taxPdf({ filename, formTitle, formSub, ident, columns, rows, note }) {
   for (let i = 1; i <= pages; i++) {
     doc.setPage(i);
     doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(120);
-    doc.text(`Prepared in Brasstally · ${todayStr()} · draft for use with CRA-certified software, not a filed return`, L, 279);
+    doc.text(footer, L, 279);
     doc.text(`Page ${i} of ${pages}`, R, 279, { align: "right" });
     doc.setTextColor(0);
   }
@@ -5561,7 +6539,7 @@ function GuideAnchor({ id, onOpen, label }) {
       className="rounded-full pl-1 pr-3 py-1 inline-flex items-center gap-2 shrink-0 transition-colors"
     >
       <span
-        style={{ background: P.brass + "22", border: `1px solid ${P.brass}`, color: P.brass, fontFamily: MONO, width: 24, height: 24 }}
+        style={{ background: P.brass + "22", border: `1px solid ${P.brass}`, color: P.brassText, fontFamily: MONO, width: 24, height: 24 }}
         className="rounded-full text-xs flex items-center justify-center shrink-0"
       >
         {g.avatar}
@@ -5587,7 +6565,7 @@ function DeadlineStrip({ rows, title = "Deadlines" }) {
         <div>
           <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs uppercase tracking-wider">Next up</div>
           <div style={{ fontFamily: SERIF }} className="text-lg leading-tight">{next.title}</div>
-          <div style={{ fontFamily: MONO, color: P.brass }} className="text-sm">{longDate(next.date)}</div>
+          <div style={{ fontFamily: MONO, color: P.brassText }} className="text-sm">{longDate(next.date)}</div>
         </div>
         <div style={{ color: P[TONE[c.tone]] || P.text, border: `1px solid ${P[TONE[c.tone]] || P.line}`, fontFamily: MONO }}
           className="rounded-full px-3 py-1 text-sm whitespace-nowrap">
@@ -5637,7 +6615,7 @@ function FormRow({ f, checked, onToggle }) {
       </button>
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-2 flex-wrap">
-          <span style={{ fontFamily: MONO, color: P.brass }} className="text-xs">{f.code}</span>
+          <span style={{ fontFamily: MONO, color: P.brassText }} className="text-xs">{f.code}</span>
           <span className="text-sm" style={{ color: checked ? P.faint : P.text }}>{f.name}</span>
           {f.fromLedger && (
             <span style={{ fontFamily: MONO, color: P.credit, border: `1px solid ${P.credit}` }} className="text-xs rounded px-1">
@@ -5652,7 +6630,7 @@ function FormRow({ f, checked, onToggle }) {
           <span style={{ fontFamily: MONO, color: P.faint }} className="text-xs">not in this year</span>
         ) : (
           <a href={f.url} target="_blank" rel="noreferrer"
-            style={{ fontFamily: MONO, color: P.brass }} className="text-xs underline decoration-dotted whitespace-nowrap">
+            style={{ fontFamily: MONO, color: P.brassText }} className="text-xs underline decoration-dotted underline-offset-2 whitespace-nowrap">
             {f.version} issue ↗
           </a>
         )}
@@ -5677,7 +6655,7 @@ function FilingPackage({ taxYear, province, done, setDone }) {
   const requiredDone = groups.always.filter((f) => done[f.code]).length;
 
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <Label>The {taxYear} filing package</Label>
@@ -5691,12 +6669,12 @@ function FilingPackage({ taxYear, province, done, setDone }) {
       </div>
 
       {separate && (
-        <p style={{ color: P.brass }} className="text-xs mt-2">{separate.note}</p>
+        <p style={{ color: P.brassText }} className="text-xs mt-2">{separate.note}</p>
       )}
 
       {changed > 0 && (
         <div className="mt-3">
-          <button onClick={() => setShowDiff(!showDiff)} style={{ color: P.brass, fontFamily: MONO }} className="text-xs underline decoration-dotted">
+          <button onClick={() => setShowDiff(!showDiff)} style={{ color: P.brassText, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">
             {showDiff ? "hide" : "show"} what changed from {taxYear - 1} to {taxYear} ({changed})
           </button>
           {showDiff && (
@@ -5707,7 +6685,7 @@ function FilingPackage({ taxYear, province, done, setDone }) {
                 </div>
               ))}
               {diff.moved.map((f) => (
-                <div key={"m" + f.code} style={{ fontFamily: MONO, color: P.brass }} className="text-xs">
+                <div key={"m" + f.code} style={{ fontFamily: MONO, color: P.brassText }} className="text-xs">
                   reissued · {f.code} moves from the {f.from} issue to the {f.version} issue
                 </div>
               ))}
@@ -5734,7 +6712,7 @@ function FilingPackage({ taxYear, province, done, setDone }) {
             <button onClick={() => setOpenGroup((g) => ({ ...g, [k]: !g[k] }))} className="w-full text-left">
               <div className="flex items-center gap-2">
                 <ChevronRight size={13} style={{ color: P.faint, transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }} />
-                <span style={{ fontFamily: MONO, color: P.brass }} className="text-xs uppercase tracking-wider">{title}</span>
+                <span style={{ fontFamily: MONO, color: P.brassText }} className="text-xs uppercase tracking-wider">{title}</span>
                 <span style={{ fontFamily: MONO, color: P.faint }} className="text-xs">({list.length})</span>
               </div>
               <div style={{ color: P.faint }} className="text-xs ml-5">{sub}</div>
@@ -5755,14 +6733,14 @@ function FilingPackage({ taxYear, province, done, setDone }) {
         <Label>Forms that travel with the return</Label>
         {T2_COMPANION_FORMS.map((f) => (
           <div key={f.code} className="flex items-start gap-2 text-xs py-1">
-            <span style={{ fontFamily: MONO, color: P.brass }} className="w-20 shrink-0">{f.code}</span>
+            <span style={{ fontFamily: MONO, color: P.brassText }} className="w-20 shrink-0">{f.code}</span>
             <span className="flex-1 min-w-0"><span style={{ color: P.text }}>{f.name}</span> <span style={{ color: P.muted }}>{f.when}</span></span>
           </div>
         ))}
       </div>
 
       <p style={{ color: P.faint }} className="text-xs mt-3">
-        Version list read from CRA's own form pages. <a href={CRA_FORMS_INDEX} target="_blank" rel="noreferrer" style={{ color: P.brass }} className="underline decoration-dotted">CRA forms and publications ↗</a>
+        Version list read from CRA's own form pages. <a href={CRA_FORMS_INDEX} target="_blank" rel="noreferrer" style={{ color: P.brassText }} className="underline decoration-dotted">CRA forms and publications ↗</a>
       </p>
     </div>
   );
@@ -5803,7 +6781,7 @@ function SendToAccountant({ subject, shortBody, fullText, files, email, setEmail
   };
 
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
       <div className="flex items-start justify-between gap-2">
         <Label>Send it to your accountant</Label>
         {guide}
@@ -5834,7 +6812,7 @@ function SendToAccountant({ subject, shortBody, fullText, files, email, setEmail
             </div>
             {files.map((f) => (
               <div key={f.name} style={{ fontFamily: MONO, color: P.muted }} className="text-xs flex items-center gap-1.5">
-                <Paperclip size={11} style={{ color: P.brass }} /> {f.name}
+                <Paperclip size={11} style={{ color: P.brassText }} /> {f.name}
               </div>
             ))}
             <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -5851,7 +6829,7 @@ function SendToAccountant({ subject, shortBody, fullText, files, email, setEmail
             <p style={{ color: P.faint }} className="text-xs">
               Then drag {files.length === 1 ? "the file" : "both files"} into the draft before you send. If your email app did not open, use Copy and paste it into webmail.
             </p>
-            {!valid && <p style={{ color: P.brass }} className="text-xs">Add their email address above to open the draft.</p>}
+            {!valid && <p style={{ color: P.brassText }} className="text-xs">Add their email address above to open the draft.</p>}
           </div>
         )}
       </div>
@@ -5928,7 +6906,7 @@ function IntegrationsTab({ data, updateLedgerMeta, onSynced, onConnectionsChange
     setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
   const exportGifiPDF = () => {
-    taxPdf({
+    formPdf({
       filename: `T2_S125_GIFI_${data.ledger.name.replace(/\s/g, "")}_FY${fy}.pdf`,
       formTitle: "Schedule 125 · Income Statement Information",
       formSub: `General Index of Financial Information (GIFI) · draft prepared from the ${data.ledger.name} ledger`,
@@ -5969,12 +6947,12 @@ function IntegrationsTab({ data, updateLedgerMeta, onSynced, onConnectionsChange
     `Balance sheet items for Schedule 100 are not tracked in this ledger and still need to come from us.`;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 stagger">
       <BankFeedCard data={data} onSynced={onSynced} onConnectionsChange={onConnectionsChange} openGuide={openGuide} onReview={onReview} />
 
       {/* ---------- CRA: T2 for business ledgers, T1 for personal ---------- */}
       {!isBiz ? <PersonalTaxCard data={data} openGuide={openGuide} /> : (
-      <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-5">
+      <section style={cardStyle()} className="p-5">
         <div className="flex items-start justify-between gap-3 flex-wrap">
           <div>
             <h2 style={{ fontFamily: SERIF }} className="text-lg leading-tight">Corporate tax (T2)</h2>
@@ -6033,7 +7011,7 @@ function IntegrationsTab({ data, updateLedgerMeta, onSynced, onConnectionsChange
           <div className="mt-4 space-y-4">
             <FilingPackage taxYear={fy} province={province} done={pkgDone} setDone={savePkgDone} />
 
-            <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+            <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
               <div className="flex justify-between items-center mb-2 flex-wrap gap-2">
                 <Label>Schedule 125 · income statement (GIFI) · {fyStart} → {fyEnd}</Label>
                 <div className="flex gap-2">
@@ -6043,12 +7021,12 @@ function IntegrationsTab({ data, updateLedgerMeta, onSynced, onConnectionsChange
                 </div>
               </div>
               {fyTx.length === 0 ? (
-                <p style={{ color: P.faint }} className="text-sm py-3">No business activity recorded in this fiscal year.</p>
+                <EmptyState compact icon={FileText} title="No business activity">Nothing is recorded in this fiscal year yet.</EmptyState>
               ) : (
                 <div className="divide-y" style={{ borderColor: P.line }}>
                   {gifiRows.map((r) => (
                     <div key={r.code + r.name} className="flex items-center gap-3 py-1.5" style={{ borderColor: P.line }}>
-                      <span style={{ fontFamily: MONO, color: P.brass }} className="text-xs w-12 shrink-0">{r.code}</span>
+                      <span style={{ fontFamily: MONO, color: P.brassText }} className="text-xs w-12 shrink-0">{r.code}</span>
                       <span className={"flex-1 text-sm truncate " + (r.strong ? "font-medium" : "")} style={{ color: r.strong ? P.text : P.muted }}>{r.name}</span>
                       <span style={{ fontFamily: MONO, color: r.final ? (r.amount >= 0 ? P.credit : P.debit) : r.amount >= 0 ? P.credit : P.text, borderTop: r.final ? `1px double ${P.brass}` : "none" }} className="text-sm tabular-nums">{fmt(r.amount)}</span>
                     </div>
@@ -6121,8 +7099,8 @@ function TransferModal({ data, others, addSub, onNewLedger, onSubmit, onClose })
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+      <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex justify-between items-start mb-1">
           <h3 style={{ fontFamily: SERIF }} className="text-xl">Move money between ledgers</h3>
           <button onClick={onClose} style={{ color: P.muted }} className="p-1"><X size={16} /></button>
@@ -6140,7 +7118,7 @@ function TransferModal({ data, others, addSub, onNewLedger, onSubmit, onClose })
                 <Label>From</Label>
                 <div style={{ background: P.bg, border: `1px solid ${P.line}`, fontFamily: MONO }} className="rounded px-2 py-1.5 text-sm truncate">{data.ledger.name} <span style={{ color: P.faint }}>· {kindLabel(data.ledger.kind)}</span></div>
               </div>
-              <ArrowLeftRight size={16} style={{ color: P.brass }} className="mt-4 shrink-0" />
+              <ArrowLeftRight size={16} style={{ color: P.brassText }} className="mt-4 shrink-0" />
               <div className="flex-1">
                 <Label>To</Label>
                 <Select value={toId} onChange={(e) => setToId(e.target.value)}>
@@ -6436,7 +7414,12 @@ function BankFeedCard({ data, onSynced, onConnectionsChange, openGuide, onReview
   const connected = (conns?.length || 0) > 0;
 
   const disconnect = async (id) => {
-    if (!window.confirm("Disconnect this bank? Entries you already imported stay in the ledger.")) return;
+    const ok = await askConfirm({
+      title: "Disconnect this bank?",
+      body: "New transactions stop syncing. Entries you already imported stay in the ledger.",
+      confirmLabel: "Disconnect",
+    });
+    if (!ok) return;
     try {
       await bank.plaid("disconnect", { connection_id: id });
       const next = (conns || []).filter((x) => x.id !== id);
@@ -6446,7 +7429,7 @@ function BankFeedCard({ data, onSynced, onConnectionsChange, openGuide, onReview
   };
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-5">
+    <section style={cardStyle()} className="p-5">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h2 style={{ fontFamily: SERIF }} className="text-lg leading-tight">Bank feed</h2>
@@ -6557,12 +7540,12 @@ function BankFeedCard({ data, onSynced, onConnectionsChange, openGuide, onReview
       })()}
 
       {!connected && (
-        <button onClick={() => setShowSetup(!showSetup)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted mt-4">
+        <button onClick={() => setShowSetup(!showSetup)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2 mt-4">
           {showSetup ? "hide" : "show"} one-time server setup
         </button>
       )}
       {showSetup && !connected && (
-        <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-3 mt-2 space-y-1.5">
+        <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-3 mt-2 space-y-1.5">
           {[
             ["1", "Run supabase/migration-bank-connections.sql and supabase/migration-bank-balances.sql in the SQL Editor"],
             ["2", "Edge Functions: add secrets PLAID_CLIENT_ID, PLAID_SECRET, and PLAID_ENV (sandbox to test, production when approved)"],
@@ -6571,7 +7554,7 @@ function BankFeedCard({ data, onSynced, onConnectionsChange, openGuide, onReview
             ["5", "Reload this page and tap Connect a bank. Console warnings about WebGPU/WASM from Plaid's own scripts are harmless, so ignore them."],
           ].map(([n, t]) => (
             <div key={n} className="flex gap-2 text-sm" style={{ color: P.muted }}>
-              <span style={{ fontFamily: MONO, color: P.brass }}>{n}.</span><span>{t}</span>
+              <span style={{ fontFamily: MONO, color: P.brassText }}>{n}.</span><span>{t}</span>
             </div>
           ))}
         </div>
@@ -6634,7 +7617,7 @@ function PersonalTaxCard({ data, openGuide }) {
     setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
   const exportPDF = () => {
-    taxPdf({
+    formPdf({
       filename: `T1_prep_${ty}_${data.ledger.name.replace(/\s/g, "")}.pdf`,
       formTitle: "T1 Preparation Summary",
       formSub: `Personal income tax working paper · draft prepared from the ${data.ledger.name} ledger`,
@@ -6675,7 +7658,7 @@ function PersonalTaxCard({ data, openGuide }) {
     `T4, T5 and RRSP slips are not in here. They come through CRA auto-fill.`;
 
   return (
-    <section style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg p-5">
+    <section style={cardStyle()} className="p-5">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h2 style={{ fontFamily: SERIF }} className="text-lg leading-tight">Personal tax (T1)</h2>
@@ -6700,7 +7683,7 @@ function PersonalTaxCard({ data, openGuide }) {
 
       {draft && (
         <div className="mt-4 space-y-4">
-          <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+          <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
             <button onClick={() => setShowForms(!showForms)} className="w-full text-left flex items-center gap-2">
               <ChevronRight size={13} style={{ color: P.faint, transform: showForms ? "rotate(90deg)" : "none", transition: "transform .15s" }} />
               <Label>What a T1 is made of</Label>
@@ -6709,7 +7692,7 @@ function PersonalTaxCard({ data, openGuide }) {
               <div className="mt-1">
                 {T1_PACKAGE.map((f) => (
                   <div key={f.code} className="flex items-start gap-2 py-1.5" style={{ borderTop: `1px solid ${P.line}` }}>
-                    <span style={{ fontFamily: MONO, color: P.brass }} className="text-xs w-24 shrink-0">{f.code}</span>
+                    <span style={{ fontFamily: MONO, color: P.brassText }} className="text-xs w-24 shrink-0">{f.code}</span>
                     <span className="flex-1 min-w-0">
                       <span className="text-sm" style={{ color: P.text }}>{f.name}</span>
                       <span className="block text-xs" style={{ color: P.muted }}>{f.when}</span>
@@ -6727,7 +7710,7 @@ function PersonalTaxCard({ data, openGuide }) {
             )}
           </div>
 
-          <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+          <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
             <div className="flex justify-between items-center mb-2 flex-wrap gap-2">
               <Label>T1 prep · {ty}</Label>
               <div className="flex gap-2">
@@ -6861,7 +7844,7 @@ function FilingConnector({ data, form, taxYear, accountantEmail }) {
 
   if (loading) {
     return (
-      <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+      <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
         <Label>Filing</Label>
         <p style={{ color: P.faint, fontFamily: MONO }} className="text-xs">checking…</p>
       </div>
@@ -6869,7 +7852,7 @@ function FilingConnector({ data, form, taxYear, accountantEmail }) {
   }
 
   return (
-    <div style={{ background: P.bg, border: `1px solid ${P.line}` }} className="rounded-lg p-4">
+    <div style={{ background: P.bg, border: `1px solid ${P.line}`, borderRadius: R.control }} className="p-4">
       <div className="flex items-start justify-between gap-2">
         <Label>Filing {form} · {taxYear}</Label>
         <span style={{ fontFamily: MONO, color: route ? P.credit : P.faint, border: `1px solid ${route ? P.credit : P.line}` }} className="text-xs rounded-full px-2 py-0.5 whitespace-nowrap">
@@ -6926,7 +7909,7 @@ function FilingConnector({ data, form, taxYear, accountantEmail }) {
                 <div className="text-sm truncate">{sw.name}</div>
                 <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs">{sw.platform || "certified software"}{sw.gifiImport ? " · spreadsheet import" : " · manual GIFI entry"}</div>
               </div>
-              <button onClick={() => setPicking(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">change</button>
+              <button onClick={() => setPicking(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">change</button>
             </div>
           )}
           {route === "accountant" && (
@@ -6935,13 +7918,13 @@ function FilingConnector({ data, form, taxYear, accountantEmail }) {
                 <div className="text-sm">Filed by your accountant</div>
                 <div style={{ fontFamily: MONO, color: P.faint }} className="text-xs truncate">{accountantEmail || "add their email below"}</div>
               </div>
-              <button onClick={() => save({ route: null, software: null })} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">change</button>
+              <button onClick={() => save({ route: null, software: null })} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">change</button>
             </div>
           )}
 
           {(route === "software" ? softwareSteps(form, sw || list[0]) : accountantSteps(form)).map(([t, b], i) => (
             <div key={i} className="flex gap-2 mb-2">
-              <span style={{ fontFamily: MONO, color: P.brass }} className="text-sm shrink-0">{i + 1}.</span>
+              <span style={{ fontFamily: MONO, color: P.brassText }} className="text-sm shrink-0">{i + 1}.</span>
               <div><div className="text-sm" style={{ color: P.text }}>{t}</div><div className="text-xs" style={{ color: P.muted }}>{b}</div></div>
             </div>
           ))}
@@ -6953,7 +7936,7 @@ function FilingConnector({ data, form, taxYear, accountantEmail }) {
                   <div style={{ fontFamily: MONO, color: P.credit }} className="text-xs">filed {rec.filed_on || ""}</div>
                   <div style={{ fontFamily: MONO, color: P.text }} className="text-sm">confirmation {rec.confirmation_number}</div>
                 </div>
-                <button onClick={() => setRecording(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted">edit</button>
+                <button onClick={() => setRecording(true)} style={{ color: P.faint, fontFamily: MONO }} className="text-xs underline decoration-dotted underline-offset-2">edit</button>
               </div>
             ) : recording ? (
               <div className="grid sm:grid-cols-3 gap-2 items-end">
@@ -7000,7 +7983,7 @@ function AccountModal({ theme, setTheme, onSignOut, onResetLedger, ledgerName, o
   };
   const sendReset = async () => {
     setMsg("");
-    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: appUrl() });
     setMsg(error ? error.message : `Password link sent to ${email}.`);
   };
   const replayTours = () => {
@@ -7010,14 +7993,14 @@ function AccountModal({ theme, setTheme, onSignOut, onResetLedger, ledgerName, o
 
   const Section = ({ title, children }) => (
     <div style={{ borderTop: `1px solid ${P.line}` }} className="pt-4 mt-4">
-      <div style={{ fontFamily: MONO, color: P.brass }} className="text-xs uppercase tracking-widest mb-2">{title}</div>
+      <div style={{ fontFamily: MONO, color: P.brassText }} className="text-xs uppercase tracking-widest mb-2">{title}</div>
       {children}
     </div>
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
-      <div style={{ background: P.surface, border: `1px solid ${P.line}` }} className="rounded-lg w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-overlay fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: P.overlay }} onClick={onClose}>
+      <div role="dialog" aria-modal="true" style={{ background: P.surface, border: `1px solid ${P.line}`, boxShadow: elev(3), borderRadius: R.panel }} className="modal-panel w-full max-w-md p-5 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         <div className="flex justify-between items-start">
           <h3 style={{ fontFamily: SERIF }} className="text-xl">Account</h3>
           <button onClick={onClose} style={{ color: P.muted }} className="p-1"><X size={16} /></button>
@@ -7035,7 +8018,7 @@ function AccountModal({ theme, setTheme, onSignOut, onResetLedger, ledgerName, o
 
         <Section title="Membership">
           <div className="flex items-center gap-2">
-            <span style={{ fontFamily: MONO, color: P.bg, background: P.brass }} className="text-xs rounded px-2 py-0.5">Early access</span>
+            <Pill solid tone="brass" mono>Early access</Pill>
             <span style={{ color: P.muted }} className="text-sm">Free · founding member</span>
           </div>
           <p style={{ color: P.faint }} className="text-xs mt-2">Unlimited ledgers while Brasstally is in early access. When paid plans arrive, founding members hear first, and your books stay yours either way.</p>
